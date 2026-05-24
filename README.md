@@ -36,6 +36,7 @@ heim --version
 heim doctor
 heim exec <grant> [<grant> ...] -- <command> [args...]
 heim config
+heim config validate
 heim policy
 heim policy validate
 heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
@@ -43,10 +44,10 @@ heim audit
 heim approvals
 ```
 
-Only `doctor`, `policy validate`, `policy check`, `exec` policy preflight and
-allowed command execution, `--help`, and `--version` are implemented today. The
-other commands are parsed and return an explicit "not implemented yet" error
-until their behavior is accepted.
+Only `doctor`, `config validate`, `policy validate`, `policy check`, `exec`
+policy preflight and allowed command execution, `--help`, and `--version` are
+implemented today. The other commands are parsed and return an explicit "not
+implemented yet" error until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -74,6 +75,35 @@ Policy files are loaded from the platform config directory by default:
 
 Heim reads all `.toml` files in that directory, ignores other files, and merges
 them into one policy document before validation.
+
+Provider configuration is loaded from the platform config directory:
+
+- Linux: `$XDG_CONFIG_HOME/heim/config.toml` when `XDG_CONFIG_HOME` is set,
+  otherwise `~/.config/heim/config.toml`
+- macOS: `~/Library/Application Support/heim/config.toml`
+- Windows: `%APPDATA%\heim\config.toml`
+
+The config schema can model AWS STS, GitHub App, and GitHub PAT providers for
+future credential issuance. Heim validates this schema but does not call
+providers or inject credentials yet.
+
+Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
+supported but should be avoided for sensitive use when better sources are
+available. On Unix, Heim requires owner-only permissions for this file.
+
+The default config file can be validated:
+
+```bash
+heim config validate
+```
+
+A specific config file and unsafe local auth file can also be validated:
+
+```bash
+heim config validate --file examples/config.toml
+heim config validate --file examples/config.toml --policy-file examples/policy.toml
+heim config validate --file examples/config.toml --auth-file ~/.config/heim/.auth.json
+```
 
 The default policy directory can be validated:
 
@@ -131,11 +161,11 @@ By default, audit writes target the platform config directory:
 
 Audit records must never contain credential secret values. `heim exec` emits one
 local audit event for the policy preflight decision. It does not contact
-providers, request approvals, issue credentials, or execute commands yet.
+providers, request approvals, or issue credentials yet.
 `heim audit` does not read audit events yet.
 
-See `docs/policy.md` and `examples/policy.toml` for the current policy model
-draft.
+See `docs/policy.md`, `docs/config.md`, `examples/policy.toml`, and
+`examples/config.toml` for the current policy and provider model drafts.
 
 ## Run Checks
 

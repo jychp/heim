@@ -60,11 +60,12 @@ github.personal-readonly
 ```
 
 Each grant points to a configured provider and defines local policy constraints.
+Provider values reference provider names from `config.toml`.
 
 ```toml
 [[grants]]
 name = "aws.prod-readonly"
-provider = "aws.prod"
+provider = "aws_prod"
 allow = ["codex"]
 commands = ["aws *"]
 approval = "jit:slack"

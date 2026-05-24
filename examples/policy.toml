@@ -5,21 +5,21 @@
 
 [[grants]]
 name = "aws.prod-readonly"
-provider = "aws.prod"
+provider = "aws_prod"
 allow = ["codex", "claude-code"]
 commands = ["aws *", "claude-code *"]
 approval = "jit:slack"
 
 [[grants]]
 name = "github.drymn-pr-write"
-provider = "github.drymn"
+provider = "github_drymn"
 allow = ["codex", "gh"]
 commands = ["gh pr *", "claude-code *"]
 approval = "jit:slack"
 
 [[grants]]
 name = "github.personal-readonly"
-provider = "github.personal"
+provider = "github_personal"
 allow = ["gh"]
 commands = ["gh repo view *", "gh pr view *"]
 approval = "grant"

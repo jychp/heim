@@ -2,7 +2,7 @@
 
 [[grants]]
 name = "aws.prod-readonly"
-provider = "aws.prod"
+provider = "aws_prod"
 allow = ["codex", "claude-code"]
 commands = ["aws *", "claude-code *"]
 approval = "jit:slack"

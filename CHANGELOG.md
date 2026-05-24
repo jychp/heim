@@ -27,5 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   require-approval policy decisions.
 - `heim exec` command execution for requests fully allowed by local policy,
   without credential injection yet.
+- Provider configuration schema for future AWS STS, GitHub App, and GitHub PAT
+  credential issuance.
+- Unsafe local auth file schema for GitHub App private keys and GitHub PATs,
+  with strict Unix file permission checks.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.
