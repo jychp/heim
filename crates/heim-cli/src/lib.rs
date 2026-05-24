@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::{ffi::OsStr, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
@@ -31,6 +33,14 @@ enum Command {
     Doctor,
     /// Execute a command with one or more named grants.
     Exec {
+        /// Single policy file to evaluate instead of the default policy directory.
+        #[arg(long, conflicts_with = "dir")]
+        file: Option<PathBuf>,
+
+        /// Policy directory to evaluate instead of the default policy directory.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
         /// Grant names to request for the command.
         #[arg(required = true, num_args = 1..)]
         grants: Vec<String>,
@@ -92,8 +102,17 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    run_from_with_requester(args, infer_requester_from_parent_process)
+}
+
+fn run_from_with_requester<I, T, F>(args: I, infer_requester: F) -> CommandResult
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+    F: FnOnce() -> Result<String, RequesterInferenceError>,
+{
     match Cli::try_parse_from(args) {
-        Ok(cli) => run(cli),
+        Ok(cli) => run(cli, infer_requester),
         Err(error) => {
             let output = error.to_string();
             if matches!(
@@ -116,14 +135,18 @@ where
     }
 }
 
-fn run(cli: Cli) -> CommandResult {
+fn run<F>(cli: Cli, infer_requester: F) -> CommandResult
+where
+    F: FnOnce() -> Result<String, RequesterInferenceError>,
+{
     match cli.command {
         Some(Command::Doctor) => ok("heim: ok\n"),
-        Some(Command::Exec { grants, command }) => not_implemented(format!(
-            "heim exec is not implemented yet; parsed {} grant(s) and {} command argument(s)\n",
-            grants.len(),
-            command.len()
-        )),
+        Some(Command::Exec {
+            file,
+            dir,
+            grants,
+            command,
+        }) => run_exec(file, dir, grants, command, infer_requester),
         Some(Command::Config) => not_implemented("heim config is not implemented yet\n"),
         Some(Command::Policy { command }) => run_policy(command),
         Some(Command::Audit) => not_implemented("heim audit is not implemented yet\n"),
@@ -146,6 +169,47 @@ fn run(cli: Cli) -> CommandResult {
             }
         }
     }
+}
+
+fn run_exec<F>(
+    file: Option<PathBuf>,
+    dir: Option<PathBuf>,
+    grants: Vec<String>,
+    command: Vec<String>,
+    infer_requester: F,
+) -> CommandResult
+where
+    F: FnOnce() -> Result<String, RequesterInferenceError>,
+{
+    let document = match load_policy_source(file, dir) {
+        Ok(document) => document,
+        Err(error) => {
+            return CommandResult {
+                code: NOT_IMPLEMENTED_EXIT_CODE,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+
+    let requester = match infer_requester() {
+        Ok(requester) => requester,
+        Err(error) => {
+            return CommandResult {
+                code: NOT_IMPLEMENTED_EXIT_CODE,
+                stdout: String::new(),
+                stderr: format!("failed to infer requester from parent process: {error}\n"),
+            };
+        }
+    };
+
+    let mut decisions = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let request = PolicyRequest::new(grant.clone(), requester.clone(), command.clone());
+        decisions.push((grant, evaluate_policy(&document.grants, &request)));
+    }
+
+    format_exec_preflight(&requester, decisions)
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -198,6 +262,56 @@ fn load_policy_source(
     heim_config::load_default_policy_dir()
 }
 
+fn format_exec_preflight(
+    requester: &str,
+    decisions: Vec<(String, PolicyDecision)>,
+) -> CommandResult {
+    if let Some((grant, PolicyDecision::Deny { reason })) = decisions
+        .iter()
+        .find(|(_, decision)| matches!(decision, PolicyDecision::Deny { .. }))
+    {
+        return CommandResult {
+            code: POLICY_DENIED_EXIT_CODE,
+            stdout: String::new(),
+            stderr: format!(
+                "exec: deny grant {grant} for requester {requester} ({})\n",
+                format_deny_reason(reason.clone())
+            ),
+        };
+    }
+
+    let approval_transports = decisions
+        .iter()
+        .filter_map(|(_, decision)| match decision {
+            PolicyDecision::RequireApproval { transport } => Some(transport.to_string()),
+            PolicyDecision::Allow | PolicyDecision::Deny { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    if approval_transports.is_empty() {
+        CommandResult {
+            code: NOT_IMPLEMENTED_EXIT_CODE,
+            stdout: format!(
+                "exec: preflight allow (requester {requester}, {} grant(s))\n",
+                decisions.len()
+            ),
+            stderr: "heim exec command execution is not implemented yet\n".to_owned(),
+        }
+    } else {
+        CommandResult {
+            code: NOT_IMPLEMENTED_EXIT_CODE,
+            stdout: format!(
+                "exec: preflight require_approval (requester {requester}, transport(s) {})\n",
+                approval_transports
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            stderr: "heim exec approval flow is not implemented yet\n".to_owned(),
+        }
+    }
+}
+
 fn format_policy_decision(decision: PolicyDecision) -> CommandResult {
     match decision {
         PolicyDecision::Allow => ok("policy: allow\n"),
@@ -232,9 +346,66 @@ fn not_implemented(stderr: impl Into<String>) -> CommandResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequesterInferenceError(String);
+
+impl RequesterInferenceError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for RequesterInferenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RequesterInferenceError {}
+
+fn infer_requester_from_parent_process() -> Result<String, RequesterInferenceError> {
+    let system = sysinfo::System::new_all();
+    let current_pid = sysinfo::get_current_pid().map_err(RequesterInferenceError::new)?;
+    let current_process = system
+        .process(current_pid)
+        .ok_or_else(|| RequesterInferenceError::new("current process was not found"))?;
+    let parent_pid = current_process
+        .parent()
+        .ok_or_else(|| RequesterInferenceError::new("parent process was not found"))?;
+    let parent_process = system
+        .process(parent_pid)
+        .ok_or_else(|| RequesterInferenceError::new("parent process metadata was not found"))?;
+
+    process_name(parent_process.name())
+        .or_else(|| {
+            parent_process
+                .exe()
+                .and_then(|path| process_name(path.file_name()?))
+        })
+        .ok_or_else(|| RequesterInferenceError::new("parent process name was empty"))
+}
+
+fn process_name(name: &OsStr) -> Option<String> {
+    let name = name.to_string_lossy();
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run_from;
+    use super::{RequesterInferenceError, run_from, run_from_with_requester};
+
+    fn run_from_requester<I, T>(args: I, requester: &str) -> super::CommandResult
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        run_from_with_requester(args, || Ok(requester.to_owned()))
+    }
 
     #[test]
     fn help_lists_available_commands() {
@@ -277,23 +448,178 @@ mod tests {
 
     #[test]
     fn exec_parses_grants_and_trailing_command_without_executing() {
-        let result = run_from([
-            "heim",
-            "exec",
-            "aws.prod-readonly",
-            "github.pr-write",
-            "--",
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_requester(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "aws.prod-readonly",
+                "--",
+                "aws",
+                "sts",
+                "get-caller-identity",
+            ],
+            "codex",
+        );
+
+        assert_eq!(result.code, 2);
+        assert_eq!(
+            result.stdout,
+            "exec: preflight require_approval (requester codex, transport(s) slack)\n"
+        );
+        assert!(
+            result
+                .stderr
+                .contains("heim exec approval flow is not implemented yet")
+        );
+    }
+
+    #[test]
+    fn exec_preflight_allows_grant_policy() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_requester(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
             "gh",
-            "pr",
-            "create",
-        ]);
+        );
+
+        assert_eq!(result.code, 2);
+        assert_eq!(
+            result.stdout,
+            "exec: preflight allow (requester gh, 1 grant(s))\n"
+        );
+        assert!(
+            result
+                .stderr
+                .contains("heim exec command execution is not implemented yet")
+        );
+    }
+
+    #[test]
+    fn exec_preflight_denies_policy_mismatch() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_requester(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            "codex",
+        );
+
+        assert_eq!(result.code, 3);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("exec: deny grant github.personal-readonly for requester codex")
+        );
+    }
+
+    #[test]
+    fn exec_preflight_requires_approval_when_any_grant_requires_jit() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_requester(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "github.drymn-pr-write",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            "gh",
+        );
+
+        assert_eq!(result.code, 2);
+        assert_eq!(
+            result.stdout,
+            "exec: preflight require_approval (requester gh, transport(s) slack)\n"
+        );
+        assert!(
+            result
+                .stderr
+                .contains("heim exec approval flow is not implemented yet")
+        );
+    }
+
+    #[test]
+    fn exec_preflight_denies_before_reporting_approval() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_requester(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "aws.prod-readonly",
+                "github.personal-readonly",
+                "--",
+                "aws",
+                "sts",
+                "get-caller-identity",
+            ],
+            "codex",
+        );
+
+        assert_eq!(result.code, 3);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("exec: deny grant github.personal-readonly for requester codex")
+        );
+    }
+
+    #[test]
+    fn exec_reports_requester_inference_failure() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_with_requester(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Err(RequesterInferenceError::new("no parent")),
+        );
 
         assert_eq!(result.code, 2);
         assert!(result.stdout.is_empty());
         assert!(
             result
                 .stderr
-                .contains("parsed 2 grant(s) and 3 command argument(s)")
+                .contains("failed to infer requester from parent process: no parent")
         );
     }
 

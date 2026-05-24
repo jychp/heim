@@ -17,5 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Local grant policy evaluation and `heim policy check`.
 - Platform config directory policy loading with platform-specific defaults (XDG
   on Linux, Application Support on macOS, APPDATA on Windows).
+- `heim exec` policy preflight with requester inference from the invoking
+  parent process.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.

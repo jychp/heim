@@ -11,6 +11,7 @@ rust-version.workspace = true
 clap = { version = "4.5.53", features = ["derive"] }
 heim-config = { version = "0.1.0", path = "../heim-config" }
 heim-policy = { version = "0.1.0", path = "../heim-policy" }
+sysinfo = { version = "0.39.2", default-features = false, features = ["system"] }
 
 [[bin]]
 name = "heim"

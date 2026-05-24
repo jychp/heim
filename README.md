@@ -43,9 +43,10 @@ heim audit
 heim approvals
 ```
 
-Only `doctor`, `policy validate`, `policy check`, `--help`, and `--version` are
-implemented today. The other commands are parsed and return an explicit "not
-implemented yet" error until their behavior is accepted.
+Only `doctor`, `policy validate`, `policy check`, `exec` policy preflight,
+`--help`, and `--version` are implemented today. The other commands are parsed
+and return an explicit "not implemented yet" error until their behavior is
+accepted.
 
 ## Grant Policy Model
 
@@ -93,8 +94,17 @@ One grant request can be evaluated locally:
 heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
 ```
 
-Policy evaluation returns `allow`, `deny`, or `require_approval`. It does not
-contact providers, request approvals, issue credentials, or execute commands.
+`heim exec` also runs a local policy preflight for one or more grants:
+
+```bash
+heim exec aws.prod-readonly -- aws sts get-caller-identity
+heim exec --file examples/policy.toml github.personal-readonly -- gh pr view 42
+```
+
+For `heim exec`, the requester is inferred from the parent process that invoked
+the `heim` binary. Policy evaluation returns `allow`, `deny`, or
+`require_approval`. It does not contact providers, request approvals, issue
+credentials, or execute commands yet.
 
 See `docs/policy.md` and `examples/policy.toml` for the current policy model
 draft.
