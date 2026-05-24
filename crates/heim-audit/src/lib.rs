@@ -252,8 +252,10 @@ impl JsonlAuditSink {
                 source,
             })?;
 
-        serde_json::to_writer(&mut file, event).map_err(AuditLogError::Serialize)?;
-        file.write_all(b"\n")
+        let mut record = serde_json::to_vec(event).map_err(AuditLogError::Serialize)?;
+        record.push(b'\n');
+
+        file.write_all(&record)
             .map_err(|source| AuditLogError::WriteFile {
                 path: self.path.display().to_string(),
                 source,
