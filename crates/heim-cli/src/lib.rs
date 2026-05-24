@@ -1,12 +1,15 @@
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{ffi::OsStr, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
 const POLICY_DENIED_EXIT_CODE: i32 = 3;
+const AUDIT_ERROR_EXIT_CODE: i32 = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommandResult {
@@ -102,17 +105,39 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    run_from_with_requester(args, infer_requester_from_parent_process)
+    run_from_with_context(
+        args,
+        infer_requester_from_parent_process,
+        default_audit_context,
+        append_default_audit_event,
+    )
 }
 
+#[cfg(test)]
 fn run_from_with_requester<I, T, F>(args: I, infer_requester: F) -> CommandResult
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
     F: FnOnce() -> Result<String, RequesterInferenceError>,
 {
+    run_from_with_context(args, infer_requester, test_audit_context, |_| Ok(()))
+}
+
+fn run_from_with_context<I, T, F, C, A>(
+    args: I,
+    infer_requester: F,
+    audit_context: C,
+    append_audit_event: A,
+) -> CommandResult
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+    F: FnOnce() -> Result<String, RequesterInferenceError>,
+    C: FnOnce() -> AuditContext,
+    A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
+{
     match Cli::try_parse_from(args) {
-        Ok(cli) => run(cli, infer_requester),
+        Ok(cli) => run(cli, infer_requester, audit_context, append_audit_event),
         Err(error) => {
             let output = error.to_string();
             if matches!(
@@ -135,9 +160,16 @@ where
     }
 }
 
-fn run<F>(cli: Cli, infer_requester: F) -> CommandResult
+fn run<F, C, A>(
+    cli: Cli,
+    infer_requester: F,
+    audit_context: C,
+    append_audit_event: A,
+) -> CommandResult
 where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
+    C: FnOnce() -> AuditContext,
+    A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
     match cli.command {
         Some(Command::Doctor) => ok("heim: ok\n"),
@@ -146,7 +178,15 @@ where
             dir,
             grants,
             command,
-        }) => run_exec(file, dir, grants, command, infer_requester),
+        }) => run_exec(
+            file,
+            dir,
+            grants,
+            command,
+            infer_requester,
+            audit_context,
+            append_audit_event,
+        ),
         Some(Command::Config) => not_implemented("heim config is not implemented yet\n"),
         Some(Command::Policy { command }) => run_policy(command),
         Some(Command::Audit) => not_implemented("heim audit is not implemented yet\n"),
@@ -171,15 +211,19 @@ where
     }
 }
 
-fn run_exec<F>(
+fn run_exec<F, C, A>(
     file: Option<PathBuf>,
     dir: Option<PathBuf>,
     grants: Vec<String>,
     command: Vec<String>,
     infer_requester: F,
+    audit_context: C,
+    append_audit_event: A,
 ) -> CommandResult
 where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
+    C: FnOnce() -> AuditContext,
+    A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
     let document = match load_policy_source(file, dir) {
         Ok(document) => document,
@@ -214,7 +258,23 @@ where
         }
     };
 
-    format_exec_preflight(evaluate_preflight(&document.grants, request))
+    let preflight = evaluate_preflight(&document.grants, request);
+    let event = audit_event_from_preflight(
+        &preflight,
+        &document.grants,
+        audit_context(),
+        env!("CARGO_PKG_VERSION"),
+    );
+
+    if let Err(error) = append_audit_event(&event) {
+        return CommandResult {
+            code: AUDIT_ERROR_EXIT_CODE,
+            stdout: String::new(),
+            stderr: format!("failed to write exec audit event: {error}\n"),
+        };
+    }
+
+    format_exec_preflight(preflight)
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -265,6 +325,141 @@ fn load_policy_source(
     }
 
     heim_config::load_default_policy_dir()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditContext {
+    request_id: String,
+    timestamp: String,
+}
+
+fn default_audit_context() -> AuditContext {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    AuditContext {
+        request_id: format!(
+            "heim-{}-{}-{}",
+            std::process::id(),
+            now.as_secs(),
+            now.subsec_nanos()
+        ),
+        timestamp: format_unix_timestamp(now.as_secs(), now.subsec_nanos()),
+    }
+}
+
+fn format_unix_timestamp(seconds: u64, nanos: u32) -> String {
+    let days = (seconds / 86_400) as i64;
+    let day_seconds = seconds % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z")
+}
+
+fn civil_from_unix_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = month_index + if month_index < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+
+    (year, month as u64, day as u64)
+}
+
+#[cfg(test)]
+fn test_audit_context() -> AuditContext {
+    AuditContext {
+        request_id: "test-request".to_owned(),
+        timestamp: "2026-05-24T12:00:00Z".to_owned(),
+    }
+}
+
+fn append_default_audit_event(
+    event: &heim_audit::AuditEvent,
+) -> Result<(), heim_audit::AuditLogError> {
+    heim_audit::JsonlAuditSink::open_default()?.append(event)
+}
+
+fn audit_event_from_preflight(
+    preflight: &ExecutionPreflight,
+    grants: &[GrantPolicy],
+    context: AuditContext,
+    heim_version: &str,
+) -> heim_audit::AuditEvent {
+    let decision = audit_decision_from_preflight(preflight);
+    let mut event = heim_audit::AuditEvent::new(
+        context.request_id,
+        context.timestamp,
+        preflight.request.requester.clone(),
+        preflight.request.command.clone(),
+        preflight.request.cwd.clone(),
+        heim_version,
+        decision,
+    )
+    .with_grants(audit_grants_from_preflight(preflight, grants));
+
+    if let Some(git) = &preflight.request.git {
+        event = event.with_git(heim_audit::AuditGitContext::new(
+            git.remote.clone(),
+            git.branch.clone(),
+        ));
+    }
+
+    event
+}
+
+fn audit_decision_from_preflight(preflight: &ExecutionPreflight) -> heim_audit::AuditDecision {
+    if let Some(denial) = preflight.first_denial() {
+        let reason = denial
+            .deny_reason()
+            .map(|reason| reason.to_string())
+            .unwrap_or_else(|| "policy denied request".to_owned());
+        return heim_audit::AuditDecision::Deny { reason };
+    }
+
+    let transports = preflight
+        .approval_transports()
+        .into_iter()
+        .map(|transport| transport.to_string())
+        .collect::<Vec<_>>();
+
+    if transports.is_empty() {
+        heim_audit::AuditDecision::Allow
+    } else {
+        heim_audit::AuditDecision::RequireApproval { transports }
+    }
+}
+
+fn audit_grants_from_preflight(
+    preflight: &ExecutionPreflight,
+    grants: &[GrantPolicy],
+) -> Vec<heim_audit::AuditGrant> {
+    preflight
+        .decisions
+        .iter()
+        .map(|decision| {
+            let grant = grants
+                .iter()
+                .find(|candidate| candidate.name.as_str() == decision.grant);
+            let provider = grant
+                .map(|grant| grant.provider.as_str())
+                .unwrap_or("unknown");
+            let approval_required = grant
+                .map(|grant| matches!(grant.approval.mode, ApprovalMode::Jit { .. }))
+                .unwrap_or(false);
+
+            heim_audit::AuditGrant::new(&decision.grant, provider, approval_required)
+        })
+        .collect()
 }
 
 fn format_exec_preflight(preflight: ExecutionPreflight) -> CommandResult {
@@ -403,7 +598,14 @@ fn process_name(name: &OsStr) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequesterInferenceError, run_from, run_from_with_requester};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use heim_audit::AuditDecision;
+
+    use super::{
+        RequesterInferenceError, run_from, run_from_with_context, run_from_with_requester,
+    };
 
     fn run_from_requester<I, T>(args: I, requester: &str) -> super::CommandResult
     where
@@ -411,6 +613,30 @@ mod tests {
         T: Into<std::ffi::OsString> + Clone,
     {
         run_from_with_requester(args, || Ok(requester.to_owned()))
+    }
+
+    fn run_from_requester_with_audit<I, T>(
+        args: I,
+        requester: &str,
+    ) -> (super::CommandResult, heim_audit::AuditEvent)
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let event = Rc::new(RefCell::new(None));
+        let event_sink = Rc::clone(&event);
+        let result = run_from_with_context(
+            args,
+            || Ok(requester.to_owned()),
+            super::test_audit_context,
+            |audit_event| {
+                *event_sink.borrow_mut() = Some(audit_event.clone());
+                Ok(())
+            },
+        );
+        let event = event.borrow_mut().take().expect("audit event");
+
+        (result, event)
     }
 
     #[test]
@@ -441,6 +667,14 @@ mod tests {
         assert_eq!(result.code, 0);
         assert_eq!(result.stdout, "heim: ok\n");
         assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn audit_timestamp_uses_utc_rfc3339_shape() {
+        assert_eq!(
+            super::format_unix_timestamp(0, 0),
+            "1970-01-01T00:00:00.000000000Z"
+        );
     }
 
     #[test]
@@ -599,6 +833,126 @@ mod tests {
                 .stderr
                 .contains("exec: deny grant github.personal-readonly for requester codex")
         );
+    }
+
+    #[test]
+    fn exec_emits_allow_audit_event() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let (result, event) = run_from_requester_with_audit(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            "gh",
+        );
+
+        assert_eq!(result.code, 2);
+        assert_eq!(event.request_id, "test-request");
+        assert_eq!(event.requester, "gh");
+        assert_eq!(event.command, ["gh", "pr", "view", "42"]);
+        assert_eq!(event.decision, AuditDecision::Allow);
+        assert_eq!(event.grants.len(), 1);
+        assert_eq!(event.grants[0].name, "github.personal-readonly");
+        assert_eq!(event.grants[0].provider, "github.personal");
+        assert!(!event.grants[0].approval_required);
+        assert_eq!(event.heim_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn exec_emits_denial_audit_event() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let (result, event) = run_from_requester_with_audit(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            "codex",
+        );
+
+        assert_eq!(result.code, 3);
+        assert_eq!(
+            event.decision,
+            AuditDecision::Deny {
+                reason: "requester codex is not allowed".to_owned()
+            }
+        );
+        assert_eq!(event.grants[0].name, "github.personal-readonly");
+        assert_eq!(event.grants[0].provider, "github.personal");
+    }
+
+    #[test]
+    fn exec_emits_require_approval_audit_event() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let (result, event) = run_from_requester_with_audit(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "aws.prod-readonly",
+                "--",
+                "aws",
+                "sts",
+                "get-caller-identity",
+            ],
+            "codex",
+        );
+
+        assert_eq!(result.code, 2);
+        assert_eq!(
+            event.decision,
+            AuditDecision::RequireApproval {
+                transports: vec!["slack".to_owned()]
+            }
+        );
+        assert_eq!(event.grants[0].name, "aws.prod-readonly");
+        assert_eq!(event.grants[0].provider, "aws.prod");
+        assert!(event.grants[0].approval_required);
+    }
+
+    #[test]
+    fn exec_fails_when_audit_event_write_fails() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from_with_context(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Ok("gh".to_owned()),
+            super::test_audit_context,
+            |_| {
+                let sink = heim_audit::JsonlAuditSink::new("/dev/null/audit.jsonl");
+                sink.append(&sample_audit_event())
+            },
+        );
+
+        assert_eq!(result.code, 4);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.contains("failed to write exec audit event"));
     }
 
     #[test]
@@ -845,5 +1199,17 @@ mod tests {
                 .stderr
                 .contains("policy: deny (command gh repo delete drymn/backend is not allowed)")
         );
+    }
+
+    fn sample_audit_event() -> heim_audit::AuditEvent {
+        heim_audit::AuditEvent::new(
+            "test-request",
+            "2026-05-24T12:00:00Z",
+            "gh",
+            ["gh", "pr", "view", "42"],
+            std::path::PathBuf::from("/workspace"),
+            env!("CARGO_PKG_VERSION"),
+            AuditDecision::Allow,
+        )
     }
 }

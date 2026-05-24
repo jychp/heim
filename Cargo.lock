@@ -140,7 +140,9 @@ name = "heim-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "heim-audit",
  "heim-config",
+ "heim-core",
  "heim-exec",
  "heim-policy",
  "sysinfo",

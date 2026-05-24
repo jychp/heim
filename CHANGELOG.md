@@ -23,5 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   future approvals and audit events.
 - `heim-audit` event model and JSONL sink under the platform config log
   directory without storing credential secret values.
+- `heim exec` preflight audit event emission for allow, deny, and
+  require-approval policy decisions.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.

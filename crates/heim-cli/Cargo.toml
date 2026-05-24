@@ -9,7 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
+heim-audit = { version = "0.1.0", path = "../heim-audit" }
 heim-config = { version = "0.1.0", path = "../heim-config" }
+heim-core = { version = "0.1.0", path = "../heim-core" }
 heim-exec = { version = "0.1.0", path = "../heim-exec" }
 heim-policy = { version = "0.1.0", path = "../heim-policy" }
 sysinfo = { version = "0.39.2", default-features = false, features = ["system"] }
