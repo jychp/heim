@@ -8,8 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-heim-core = { workspace = true }
-heim-policy = { workspace = true }
+heim-core = { version = "0.1.0", path = "../heim-core" }
+heim-policy = { version = "0.1.0", path = "../heim-policy" }
 
 [lints]
 workspace = true
