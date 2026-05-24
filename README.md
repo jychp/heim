@@ -109,10 +109,9 @@ credentials, or execute commands yet.
 The `heim-exec` crate builds the local execution context used by this preflight:
 requested grants, inferred requester, wrapped command, current working
 directory, and Git remote or branch metadata when they can be detected. This
-context is prepared for future approval messages, provider calls, and audit
-events, but it is not persisted yet. Git metadata detection is best-effort; Heim
-continues without it when `git` is unavailable or the current directory is not a
-Git repository.
+context is prepared for future approval messages and provider calls. Git
+metadata detection is best-effort; Heim continues without it when `git` is
+unavailable or the current directory is not a Git repository.
 
 ## Audit Model
 
@@ -121,15 +120,17 @@ records request context, grant/provider names, policy decisions, approval
 metadata, credential issuance timestamps, and redacted credential carrier
 metadata such as environment variable names.
 
-By default, future audit writes target the platform config directory:
+By default, audit writes target the platform config directory:
 
 - Linux: `$XDG_CONFIG_HOME/heim/logs/audit.jsonl` when `XDG_CONFIG_HOME` is set,
   otherwise `~/.config/heim/logs/audit.jsonl`
 - macOS: `~/Library/Application Support/heim/logs/audit.jsonl`
 - Windows: `%APPDATA%\heim\logs\audit.jsonl`
 
-Audit records must never contain credential secret values. `heim exec` does not
-emit audit events yet, and `heim audit` does not read them yet.
+Audit records must never contain credential secret values. `heim exec` emits one
+local audit event for the policy preflight decision. It does not contact
+providers, request approvals, issue credentials, or execute commands yet.
+`heim audit` does not read audit events yet.
 
 See `docs/policy.md` and `examples/policy.toml` for the current policy model
 draft.

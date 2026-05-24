@@ -2,8 +2,8 @@
 
 Heim audit events describe local security-relevant decisions and credential
 issuance metadata. The current implementation defines the typed event model in
-`heim-audit` and can append those events to a local JSONL file. It does not
-expose `heim audit` or emit events from `heim exec` yet.
+`heim-audit` and can append those events to a local JSONL file. `heim exec`
+emits policy preflight audit events. It does not expose `heim audit` yet.
 
 ## Event Scope
 
@@ -41,6 +41,16 @@ The current decision model covers the expected v0 lifecycle:
 These are event labels only. They do not imply that approval calls, provider
 calls, command execution, or CLI integration are implemented.
 
+`heim exec` currently emits only the policy preflight decisions:
+
+- `Allow`
+- `Deny`
+- `RequireApproval`
+
+Those events include the inferred requester, wrapped command, working
+directory, best-effort Git metadata, requested grants, provider names, and
+whether each grant policy requires approval.
+
 ## Credential Metadata
 
 Audit events must never contain credential secret values.
@@ -75,6 +85,6 @@ The default audit log file is:
 - macOS: `~/Library/Application Support/heim/logs/audit.jsonl`
 - Windows: `%APPDATA%\heim\logs\audit.jsonl`
 
-The sink creates the `logs` directory when it writes. Event emission from
-`heim exec` and audit log viewing through `heim audit` are intentionally
-deferred.
+The sink creates the `logs` directory when it writes. `heim exec` fails if it
+cannot write the preflight audit event. Audit log viewing through `heim audit`
+is intentionally deferred.
