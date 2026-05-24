@@ -114,6 +114,16 @@ events, but it is not persisted yet. Git metadata detection is best-effort; Heim
 continues without it when `git` is unavailable or the current directory is not a
 Git repository.
 
+## Audit Model
+
+`heim-audit` defines typed audit events for future local audit persistence. The
+model records request context, grant/provider names, policy decisions, approval
+metadata, credential issuance timestamps, and redacted credential carrier
+metadata such as environment variable names.
+
+It does not write JSONL or CLI audit output yet. Audit records must never
+contain credential secret values.
+
 See `docs/policy.md` and `examples/policy.toml` for the current policy model
 draft.
 

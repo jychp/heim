@@ -21,5 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   parent process.
 - `heim-exec` execution context planning with cwd and Git metadata detection for
   future approvals and audit events.
+- `heim-audit` event model for future local audit persistence without storing
+  credential secret values.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.
