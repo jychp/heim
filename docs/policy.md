@@ -10,6 +10,7 @@ return `allow`, `deny`, or `require_approval`.
 ```bash
 heim policy validate
 heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
+heim exec aws.prod-readonly -- aws sts get-caller-identity
 ```
 
 ## Policy Directory
@@ -80,6 +81,11 @@ allow = ["codex", "claude-code", "*"]
 
 `*` means any requester binary may ask for the grant, subject to the rest of the
 grant policy.
+
+For `heim policy check`, the requester is provided explicitly with
+`--requester`. For `heim exec`, the requester is inferred from the parent
+process that invoked the `heim` binary. This models the tool asking Heim for a
+grant, rather than the wrapped command that would receive credentials later.
 
 ## Commands
 
@@ -154,3 +160,24 @@ match, the decision is `deny`.
 
 This is still local policy evaluation only. Heim does not contact Slack, issue
 provider credentials, write audit events, or spawn child processes in this path.
+
+## Exec Preflight
+
+`heim exec` evaluates every requested grant against the loaded policy before any
+future approval or credential issuance can happen:
+
+```bash
+heim exec aws.prod-readonly github.drymn-pr-write -- claude-code
+```
+
+The same policy source options are available for local testing:
+
+```bash
+heim exec --file examples/policy.toml github.personal-readonly -- gh pr view 42
+heim exec --dir examples/policies aws.prod-readonly -- aws sts get-caller-identity
+```
+
+The current implementation stops after preflight. It returns an explicit
+not-implemented exit code when a request is allowed or requires approval,
+because command execution and approval transport calls are intentionally not
+implemented yet. Denied requests return the policy denial exit code.
