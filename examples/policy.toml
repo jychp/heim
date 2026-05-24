@@ -1,0 +1,29 @@
+# Example policy draft for the current Heim grant model.
+#
+# Validate with:
+# heim policy validate --file examples/policy.toml
+
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws.prod"
+allow = ["codex", "claude-code"]
+commands = ["aws *", "claude-code *"]
+approval = "jit:slack"
+
+[[grants]]
+name = "github.drymn-pr-write"
+provider = "github.drymn"
+allow = ["codex", "gh"]
+commands = ["gh pr *", "claude-code *"]
+approval = "jit:slack"
+
+[[grants]]
+name = "github.personal-readonly"
+provider = "github.personal"
+allow = ["gh"]
+commands = ["gh repo view *", "gh pr view *"]
+approval = "grant"
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
