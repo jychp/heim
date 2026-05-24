@@ -169,10 +169,25 @@ impl LocalAuthFile {
 }
 
 /// Secret material stored in `.auth.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LocalAuthSecret {
     GithubAppPrivateKey { pem: String },
     GithubPat { token: String },
+}
+
+impl fmt::Debug for LocalAuthSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GithubAppPrivateKey { .. } => formatter
+                .debug_struct("GithubAppPrivateKey")
+                .field("pem", &"<redacted>")
+                .finish(),
+            Self::GithubPat { .. } => formatter
+                .debug_struct("GithubPat")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Return Heim's default policy directory.
@@ -1314,6 +1329,16 @@ approval = "grant"
             auth.get("github_personal_pat"),
             Some(LocalAuthSecret::GithubPat { .. })
         ));
+    }
+
+    #[test]
+    fn unsafe_local_auth_debug_redacts_secret_values() {
+        let auth = parse_auth_json_str(VALID_AUTH).expect("valid auth");
+        let debug = format!("{auth:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("redacted\n-----END PRIVATE KEY"));
+        assert!(!debug.contains("github_pat\", token: \"redacted"));
     }
 
     #[test]
