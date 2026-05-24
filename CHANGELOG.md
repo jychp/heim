@@ -9,3 +9,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Initial Rust workspace scaffold.
+- Initial typed CLI command surface for `heim`.
+- Minimal `cargo-deny` policy for dependency license, advisory, and source
+  checks, wired into GitHub Actions.
