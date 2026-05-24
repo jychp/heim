@@ -28,3 +28,15 @@ jobs:
 
       - name: Run checks
         run: make ci
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@091bd13faf7e96935df105635d17ce9a607bc99d # v2
+        with:
+          command: check
