@@ -31,5 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   credential issuance.
 - Unsafe local auth file schema for GitHub App private keys and GitHub PATs,
   with strict Unix file permission checks.
+- Unsafe local auth secret source resolution for GitHub App private keys and
+  GitHub PATs, without provider calls or credential injection.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.

@@ -90,6 +90,8 @@ providers or inject credentials yet.
 Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
 supported but should be avoided for sensitive use when better sources are
 available. On Unix, Heim requires owner-only permissions for this file.
+The `heim-sources` crate can resolve these local auth references into typed
+secret material for future providers, with redacted debug output.
 
 The default config file can be validated:
 
