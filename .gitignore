@@ -24,6 +24,7 @@ TODO.md
 *.db
 
 # Local secrets and keys
+.auth.json
 *.pem
 *.key
 *.crt

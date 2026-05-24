@@ -1,0 +1,22 @@
+# Example Heim config for provider definitions.
+#
+# This file contains non-secret provider metadata. Unsafe local secrets, if
+# used, live in <config>/heim/.auth.json and must not be committed.
+
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+region = "eu-west-1"
+duration = "15m"
+source_profile = "prod"
+
+[providers.github_drymn]
+type = "github_app"
+app_id = 123456
+installation_id = 987654
+private_key = { auth = "github_drymn_app_private_key" }
+repositories = ["drymn/backend"]
+
+[providers.github_personal]
+type = "github_pat"
+token = { auth = "github_personal_pat" }

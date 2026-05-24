@@ -1,5 +1,11 @@
 # Examples
 
+- `policy.toml` shows a single-file policy draft.
+- `policies/` shows the same policy split across multiple files.
+- `config.toml` shows provider config without secret values.
+- `auth.example.json` shows the unsafe local auth file shape with redacted
+  values.
+
 Example configurations and workflows live here while the specification is
 in progress.
 

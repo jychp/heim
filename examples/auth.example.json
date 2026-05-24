@@ -1,0 +1,10 @@
+{
+  "github_drymn_app_private_key": {
+    "type": "github_app_private_key",
+    "pem": "-----BEGIN PRIVATE KEY-----\nredacted\n-----END PRIVATE KEY-----\n"
+  },
+  "github_personal_pat": {
+    "type": "github_pat",
+    "token": "redacted"
+  }
+}

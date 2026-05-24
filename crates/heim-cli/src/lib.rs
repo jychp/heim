@@ -54,7 +54,10 @@ enum Command {
         command: Vec<String>,
     },
     /// Manage Heim configuration.
-    Config,
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
     /// Inspect and test policy definitions.
     Policy {
         #[command(subcommand)]
@@ -98,6 +101,24 @@ enum PolicyCommand {
         /// Command and arguments to check after `--`.
         #[arg(required = true, last = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Validate Heim provider configuration.
+    Validate {
+        /// Config file to validate instead of the default config file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+
+        /// Policy file to validate against provider references in the config.
+        #[arg(long)]
+        policy_file: Option<PathBuf>,
+
+        /// Unsafe local auth file to validate.
+        #[arg(long)]
+        auth_file: Option<PathBuf>,
     },
 }
 
@@ -203,7 +224,7 @@ where
             append_audit_event,
             execute_command,
         ),
-        Some(Command::Config) => not_implemented("heim config is not implemented yet\n"),
+        Some(Command::Config { command }) => run_config(command),
         Some(Command::Policy { command }) => run_policy(command),
         Some(Command::Audit) => not_implemented("heim audit is not implemented yet\n"),
         Some(Command::Approvals) => not_implemented("heim approvals is not implemented yet\n"),
@@ -327,6 +348,69 @@ fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
             },
         },
         None => not_implemented("heim policy is not implemented yet\n"),
+    }
+}
+
+fn run_config(command: Option<ConfigCommand>) -> CommandResult {
+    match command {
+        Some(ConfigCommand::Validate {
+            file,
+            policy_file,
+            auth_file,
+        }) => {
+            let config = match file {
+                Some(file) => heim_config::load_config_file(file),
+                None => heim_config::load_default_config_file(),
+            };
+
+            let config = match config {
+                Ok(config) => config,
+                Err(error) => {
+                    return CommandResult {
+                        code: 2,
+                        stdout: String::new(),
+                        stderr: format!("{error}\n"),
+                    };
+                }
+            };
+
+            if let Some(policy_file) = policy_file {
+                let policy = match heim_config::load_policy_file(policy_file) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        return CommandResult {
+                            code: 2,
+                            stdout: String::new(),
+                            stderr: format!("{error}\n"),
+                        };
+                    }
+                };
+
+                if let Err(error) = heim_config::validate_policy_provider_refs(&policy, &config) {
+                    return CommandResult {
+                        code: 2,
+                        stdout: String::new(),
+                        stderr: format!("{error}\n"),
+                    };
+                }
+            }
+
+            if let Some(auth_file) = auth_file
+                && let Err(error) = heim_config::load_auth_file(auth_file)
+            {
+                return CommandResult {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: format!("{error}\n"),
+                };
+            }
+
+            ok(format!(
+                "config: ok ({} provider(s))\n",
+                config.providers.len()
+            ))
+        }
+        None => not_implemented("heim config is not implemented yet\n"),
     }
 }
 
@@ -658,7 +742,10 @@ fn process_name(name: &OsStr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use heim_audit::AuditDecision;
 
@@ -727,6 +814,78 @@ mod tests {
         assert_eq!(result.code, 0);
         assert_eq!(result.stdout, "heim: ok\n");
         assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn config_validate_accepts_config_file() {
+        let file = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from(["heim", "config", "validate", "--file", &file]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(result.stdout, "config: ok (3 provider(s))\n");
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn config_validate_checks_policy_provider_refs() {
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let policy = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "config",
+            "validate",
+            "--file",
+            &config,
+            "--policy-file",
+            &policy,
+        ]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(result.stdout, "config: ok (3 provider(s))\n");
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn config_validate_rejects_unknown_policy_provider_ref() {
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "aws.prod-readonly"
+provider = "missing_provider"
+allow = ["codex"]
+commands = ["aws *"]
+approval = "grant"
+"#,
+        );
+        let result = run_from([
+            "heim",
+            "config",
+            "validate",
+            "--file",
+            &config,
+            "--policy-file",
+            policy.path().to_str().expect("utf-8 path"),
+        ]);
+
+        assert_eq!(result.code, 2);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("grant aws.prod-readonly references provider missing_provider")
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_config_file() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from(["heim", "config", "validate", "--file", &file]);
+
+        assert_eq!(result.code, 2);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.contains("Heim config must contain"));
     }
 
     #[test]
@@ -951,7 +1110,7 @@ mod tests {
         assert_eq!(event.decision, AuditDecision::Allow);
         assert_eq!(event.grants.len(), 1);
         assert_eq!(event.grants[0].name, "github.personal-readonly");
-        assert_eq!(event.grants[0].provider, "github.personal");
+        assert_eq!(event.grants[0].provider, "github_personal");
         assert!(!event.grants[0].approval_required);
         assert_eq!(event.heim_version, env!("CARGO_PKG_VERSION"));
     }
@@ -983,7 +1142,7 @@ mod tests {
             }
         );
         assert_eq!(event.grants[0].name, "github.personal-readonly");
-        assert_eq!(event.grants[0].provider, "github.personal");
+        assert_eq!(event.grants[0].provider, "github_personal");
     }
 
     #[test]
@@ -1012,7 +1171,7 @@ mod tests {
             }
         );
         assert_eq!(event.grants[0].name, "aws.prod-readonly");
-        assert_eq!(event.grants[0].provider, "aws.prod");
+        assert_eq!(event.grants[0].provider, "aws_prod");
         assert!(event.grants[0].approval_required);
     }
 
@@ -1302,5 +1461,34 @@ mod tests {
             env!("CARGO_PKG_VERSION"),
             AuditDecision::Allow,
         )
+    }
+
+    struct TestFile {
+        path: PathBuf,
+    }
+
+    impl TestFile {
+        fn new(prefix: &str, contents: &str) -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+            let path = std::env::temp_dir().join(format!(
+                "heim-cli-{prefix}-{}-{}.toml",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::write(&path, contents).expect("write test file");
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
