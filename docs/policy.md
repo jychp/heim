@@ -4,10 +4,12 @@ Heim policy describes which temporary credential grants can be requested, who
 may request them, which commands may run with them, and how approval is decided.
 
 The policy loader validates TOML policy documents and converts grants into the
-typed core model. Runtime policy evaluation is not implemented yet.
+typed core model. The policy engine can evaluate one local grant request and
+return `allow`, `deny`, or `require_approval`.
 
 ```bash
 heim policy validate --file examples/policy.toml
+heim policy check --file examples/policy.toml aws.prod-readonly --requester codex -- aws sts get-caller-identity
 ```
 
 ## Grants
@@ -89,3 +91,30 @@ channel = "#heim-approvals"
 
 Transport configuration is intentionally separate from grants so Slack can be
 configured once and reused by multiple grants.
+
+## Evaluation
+
+`heim policy check` evaluates one grant request without executing the command:
+
+```bash
+heim policy check --file examples/policy.toml github.personal-readonly --requester gh -- gh pr view 42
+```
+
+The decision is based on:
+
+- the named grant
+- the requester binary
+- the command rule match
+- the grant approval mode
+
+If the grant uses `approval = "grant"` and the requester and command match, the
+decision is `allow`.
+
+If the grant uses `approval = "jit:slack"` and the requester and command match,
+the decision is `require_approval` with the configured transport.
+
+If the grant is unknown, the requester does not match, or the command does not
+match, the decision is `deny`.
+
+This is still local policy evaluation only. Heim does not contact Slack, issue
+provider credentials, write audit events, or spawn child processes in this path.
