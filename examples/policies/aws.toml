@@ -1,0 +1,8 @@
+# AWS grant examples.
+
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws.prod"
+allow = ["codex", "claude-code"]
+commands = ["aws *", "claude-code *"]
+approval = "jit:slack"

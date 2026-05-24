@@ -1,0 +1,15 @@
+# GitHub grant examples.
+
+[[grants]]
+name = "github.drymn-pr-write"
+provider = "github.drymn"
+allow = ["codex", "gh"]
+commands = ["gh pr *", "claude-code *"]
+approval = "jit:slack"
+
+[[grants]]
+name = "github.personal-readonly"
+provider = "github.personal"
+allow = ["gh"]
+commands = ["gh repo view *", "gh pr view *"]
+approval = "grant"

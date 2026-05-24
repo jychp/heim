@@ -1,0 +1,5 @@
+# Shared approval transport examples.
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"

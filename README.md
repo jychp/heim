@@ -37,8 +37,8 @@ heim doctor
 heim exec <grant> [<grant> ...] -- <command> [args...]
 heim config
 heim policy
-heim policy validate --file examples/policy.toml
-heim policy check --file examples/policy.toml aws.prod-readonly --requester codex -- aws sts get-caller-identity
+heim policy validate
+heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
 heim audit
 heim approvals
 ```
@@ -64,16 +64,33 @@ Grant policies can express:
 These are model types only. They do not load config, contact providers, request
 approval, or execute commands yet.
 
-Policy files can be loaded and validated:
+Policy files are loaded from the platform config directory by default:
+
+- Linux: `$XDG_CONFIG_HOME/heim/policies` when `XDG_CONFIG_HOME` is set,
+  otherwise `~/.config/heim/policies`
+- macOS: `~/Library/Application Support/heim/policies`
+- Windows: `%APPDATA%\heim\policies`
+
+Heim reads all `.toml` files in that directory, ignores other files, and merges
+them into one policy document before validation.
+
+The default policy directory can be validated:
+
+```bash
+heim policy validate
+```
+
+A specific file or directory can also be validated for local testing:
 
 ```bash
 heim policy validate --file examples/policy.toml
+heim policy validate --dir examples/policies
 ```
 
 One grant request can be evaluated locally:
 
 ```bash
-heim policy check --file examples/policy.toml aws.prod-readonly --requester codex -- aws sts get-caller-identity
+heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
 ```
 
 Policy evaluation returns `allow`, `deny`, or `require_approval`. It does not
