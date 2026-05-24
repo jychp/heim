@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 heim-core = { version = "0.1.0", path = "../heim-core" }
-serde = { version = "1.0.228", features = ["derive"] }
+serde.workspace = true
 toml = "1.1.2"
 
 [lints]

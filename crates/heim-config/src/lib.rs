@@ -32,6 +32,34 @@ pub fn default_policy_dir() -> Result<PathBuf, ConfigError> {
     default_policy_dir_from_env(|name| env::var_os(name))
 }
 
+/// Return Heim's default configuration directory.
+///
+/// This is the platform configuration directory with the `heim` application
+/// directory appended.
+pub fn default_heim_config_dir() -> Result<PathBuf, ConfigError> {
+    default_heim_config_dir_from_env(|name| env::var_os(name))
+}
+
+/// Return Heim's default local log directory.
+pub fn default_log_dir() -> Result<PathBuf, ConfigError> {
+    default_log_dir_from_env(|name| env::var_os(name))
+}
+
+/// Return Heim's default local audit JSONL file.
+pub fn default_audit_log_file() -> Result<PathBuf, ConfigError> {
+    default_audit_log_file_from_env(|name| env::var_os(name))
+}
+
+/// Return Heim's default local audit JSONL file from an injected environment.
+///
+/// This is mainly useful for deterministic tests and callers that need to
+/// preview the platform default without reading the process environment.
+pub fn default_audit_log_file_from_env(
+    mut var_os: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PathBuf, ConfigError> {
+    Ok(default_log_dir_from_env(&mut var_os)?.join("audit.jsonl"))
+}
+
 /// Load and validate all TOML policy files from Heim's default policy directory.
 pub fn load_default_policy_dir() -> Result<PolicyDocument, ConfigError> {
     load_policy_dir(default_policy_dir()?)
@@ -307,8 +335,20 @@ fn has_toml_extension(path: &Path) -> bool {
 fn default_policy_dir_from_env(
     mut var_os: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<PathBuf, ConfigError> {
+    Ok(default_heim_config_dir_from_env(&mut var_os)?.join("policies"))
+}
+
+fn default_log_dir_from_env(
+    mut var_os: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PathBuf, ConfigError> {
+    Ok(default_heim_config_dir_from_env(&mut var_os)?.join("logs"))
+}
+
+fn default_heim_config_dir_from_env(
+    mut var_os: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PathBuf, ConfigError> {
     let config_dir = platform_config_dir(&mut var_os)?;
-    Ok(config_dir.join("heim").join("policies"))
+    Ok(config_dir.join("heim"))
 }
 
 #[cfg(target_os = "macos")]
@@ -530,7 +570,10 @@ mod tests {
 
     use heim_core::ApprovalMode;
 
-    use super::{ConfigError, default_policy_dir_from_env, load_policy_dir, parse_policy_str};
+    use super::{
+        ConfigError, default_audit_log_file_from_env, default_log_dir_from_env,
+        default_policy_dir_from_env, load_policy_dir, parse_policy_str,
+    };
 
     const VALID_POLICY: &str = r##"
 [[grants]]
@@ -716,6 +759,32 @@ approval = "grant"
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
+    fn default_log_dir_uses_xdg_config_home_on_linux() {
+        let path = default_log_dir_from_env(|name| match name {
+            "XDG_CONFIG_HOME" => Some(OsString::from("/tmp/config")),
+            "HOME" => Some(OsString::from("/home/alice")),
+            _ => None,
+        })
+        .expect("default log directory");
+
+        assert_eq!(path, PathBuf::from("/tmp/config/heim/logs"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn default_audit_log_file_uses_xdg_config_home_on_linux() {
+        let path = default_audit_log_file_from_env(|name| match name {
+            "XDG_CONFIG_HOME" => Some(OsString::from("/tmp/config")),
+            "HOME" => Some(OsString::from("/home/alice")),
+            _ => None,
+        })
+        .expect("default audit log file");
+
+        assert_eq!(path, PathBuf::from("/tmp/config/heim/logs/audit.jsonl"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
     fn default_policy_dir_falls_back_to_home_config_on_linux() {
         let path = default_policy_dir_from_env(|name| match name {
             "HOME" => Some(OsString::from("/home/alice")),
@@ -741,6 +810,21 @@ approval = "grant"
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_log_dir_uses_application_support_on_macos() {
+        let path = default_log_dir_from_env(|name| match name {
+            "HOME" => Some(OsString::from("/Users/alice")),
+            _ => None,
+        })
+        .expect("default log directory");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/alice/Library/Application Support/heim/logs")
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn default_policy_dir_uses_appdata_on_windows() {
@@ -754,6 +838,22 @@ approval = "grant"
         assert_eq!(
             path,
             PathBuf::from(r"C:\Users\Alice\AppData\Roaming").join("heim/policies")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_log_dir_uses_appdata_on_windows() {
+        let path = default_log_dir_from_env(|name| match name {
+            "APPDATA" => Some(OsString::from(r"C:\Users\Alice\AppData\Roaming")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\Alice")),
+            _ => None,
+        })
+        .expect("default log directory");
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\Alice\AppData\Roaming").join("heim/logs")
         );
     }
 

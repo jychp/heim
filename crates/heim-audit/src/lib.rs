@@ -1,12 +1,21 @@
 //! Audit event model for Heim.
 //!
-//! This crate defines typed audit events only. It does not persist events to
-//! JSONL, contact providers, or execute commands.
+//! This crate defines typed audit events and local JSONL persistence. It does
+//! not contact providers or execute commands.
 
+use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
+use heim_config::default_audit_log_file;
+#[cfg(test)]
+use heim_config::default_audit_log_file_from_env;
+use serde::{Deserialize, Serialize};
+
 /// One local audit event for a Heim request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub request_id: String,
     pub timestamp: String,
@@ -68,7 +77,7 @@ impl AuditEvent {
 }
 
 /// Git metadata attached to an audit event when it can be detected locally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditGitContext {
     pub remote: Option<String>,
     pub branch: Option<String>,
@@ -81,7 +90,7 @@ impl AuditGitContext {
 }
 
 /// Grant-specific metadata recorded in an audit event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditGrant {
     pub name: String,
     pub provider: String,
@@ -124,7 +133,7 @@ impl AuditGrant {
 ///
 /// This intentionally stores only credential kind and exposed carrier names,
 /// such as environment variable names. It must not store secret values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditCredentialMetadata {
     pub kind: String,
     pub env_vars: Vec<String>,
@@ -155,7 +164,8 @@ impl AuditCredentialMetadata {
 }
 
 /// High-level outcome recorded for an audit event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditDecision {
     Allow,
     Deny { reason: String },
@@ -167,7 +177,7 @@ pub enum AuditDecision {
 }
 
 /// Approval metadata attached when a request enters or completes approval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditApproval {
     pub transport: String,
     pub approver: Option<String>,
@@ -196,13 +206,134 @@ impl AuditApproval {
     }
 }
 
+/// Append-only JSONL sink for local audit events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonlAuditSink {
+    path: PathBuf,
+}
+
+impl JsonlAuditSink {
+    /// Build a sink targeting Heim's default audit log file.
+    pub fn open_default() -> Result<Self, AuditLogError> {
+        Ok(Self::new(default_audit_log_file()?))
+    }
+
+    #[cfg(test)]
+    fn open_default_from_env(
+        var_os: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Self, AuditLogError> {
+        Ok(Self::new(default_audit_log_file_from_env(var_os)?))
+    }
+
+    /// Build a sink targeting an explicit JSONL file.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append one event as one JSON object followed by a newline.
+    pub fn append(&self, event: &AuditEvent) -> Result<(), AuditLogError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| AuditLogError::CreateDirectory {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|source| AuditLogError::OpenFile {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+
+        serde_json::to_writer(&mut file, event).map_err(AuditLogError::Serialize)?;
+        file.write_all(b"\n")
+            .map_err(|source| AuditLogError::WriteFile {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+
+        Ok(())
+    }
+}
+
+/// Error raised while writing local audit logs.
+#[derive(Debug)]
+pub enum AuditLogError {
+    Config(heim_config::ConfigError),
+    CreateDirectory {
+        path: String,
+        source: std::io::Error,
+    },
+    OpenFile {
+        path: String,
+        source: std::io::Error,
+    },
+    WriteFile {
+        path: String,
+        source: std::io::Error,
+    },
+    Serialize(serde_json::Error),
+}
+
+impl fmt::Display for AuditLogError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(source) => write!(formatter, "failed to resolve audit log path: {source}"),
+            Self::CreateDirectory { path, source } => {
+                write!(
+                    formatter,
+                    "failed to create audit log directory {path}: {source}"
+                )
+            }
+            Self::OpenFile { path, source } => {
+                write!(formatter, "failed to open audit log file {path}: {source}")
+            }
+            Self::WriteFile { path, source } => {
+                write!(formatter, "failed to write audit log file {path}: {source}")
+            }
+            Self::Serialize(source) => {
+                write!(formatter, "failed to serialize audit event: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuditLogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::CreateDirectory { source, .. } => Some(source),
+            Self::OpenFile { source, .. } => Some(source),
+            Self::WriteFile { source, .. } => Some(source),
+            Self::Serialize(source) => Some(source),
+        }
+    }
+}
+
+impl From<heim_config::ConfigError> for AuditLogError {
+    fn from(source: heim_config::ConfigError) -> Self {
+        Self::Config(source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         AuditApproval, AuditCredentialMetadata, AuditDecision, AuditEvent, AuditGitContext,
-        AuditGrant,
+        AuditGrant, JsonlAuditSink,
     };
 
     #[test]
@@ -340,5 +471,151 @@ mod tests {
         assert_eq!(event.grants[0].name, "aws.prod-readonly");
         assert_eq!(event.grants[1].name, "github.drymn-pr-write");
         assert!(event.grants.iter().all(|grant| grant.approval_required));
+    }
+
+    #[test]
+    fn serializes_audit_event_as_json() {
+        let event = sample_event("req-5", AuditDecision::Allow);
+
+        let json = serde_json::to_string(&event).expect("serialize event");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(value["request_id"], "req-5");
+        assert_eq!(value["decision"]["type"], "allow");
+        assert_eq!(value["grants"][0]["name"], "aws.prod-readonly");
+    }
+
+    #[test]
+    fn deserializes_audit_event_from_json() {
+        let event = sample_event(
+            "req-6",
+            AuditDecision::Deny {
+                reason: "requester gh is not allowed".to_owned(),
+            },
+        );
+
+        let json = serde_json::to_string(&event).expect("serialize event");
+        let parsed: AuditEvent = serde_json::from_str(&json).expect("deserialize event");
+
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn jsonl_sink_appends_one_event_per_line() {
+        let dir = TempAuditDir::new();
+        let log = dir.path().join("nested").join("audit.jsonl");
+        let sink = JsonlAuditSink::new(&log);
+
+        sink.append(&sample_event("req-7", AuditDecision::Allow))
+            .expect("append first event");
+        sink.append(&sample_event(
+            "req-8",
+            AuditDecision::CommandCompleted { exit_code: Some(0) },
+        ))
+        .expect("append second event");
+
+        let contents = fs::read_to_string(log).expect("read audit log");
+        let lines = contents.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first line json");
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("second line json");
+
+        assert_eq!(first["request_id"], "req-7");
+        assert_eq!(second["decision"]["type"], "command_completed");
+    }
+
+    #[test]
+    fn jsonl_sink_exposes_default_audit_file_name() {
+        let sink = JsonlAuditSink::new(PathBuf::from("/tmp/heim/logs/audit.jsonl"));
+
+        assert_eq!(sink.path(), Path::new("/tmp/heim/logs/audit.jsonl"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn default_sink_uses_config_log_file_on_linux() {
+        let sink = JsonlAuditSink::open_default_from_env(|name| match name {
+            "XDG_CONFIG_HOME" => Some(OsString::from("/tmp/config")),
+            "HOME" => Some(OsString::from("/home/alice")),
+            _ => None,
+        })
+        .expect("default sink");
+
+        assert_eq!(sink.path(), Path::new("/tmp/config/heim/logs/audit.jsonl"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_sink_uses_config_log_file_on_macos() {
+        let sink = JsonlAuditSink::open_default_from_env(|name| match name {
+            "HOME" => Some(OsString::from("/Users/alice")),
+            _ => None,
+        })
+        .expect("default sink");
+
+        assert_eq!(
+            sink.path(),
+            Path::new("/Users/alice/Library/Application Support/heim/logs/audit.jsonl")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_sink_uses_config_log_file_on_windows() {
+        let sink = JsonlAuditSink::open_default_from_env(|name| match name {
+            "APPDATA" => Some(OsString::from(r"C:\Users\Alice\AppData\Roaming")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\Alice")),
+            _ => None,
+        })
+        .expect("default sink");
+
+        assert_eq!(
+            sink.path(),
+            PathBuf::from(r"C:\Users\Alice\AppData\Roaming").join("heim/logs/audit.jsonl")
+        );
+    }
+
+    fn sample_event(request_id: &str, decision: AuditDecision) -> AuditEvent {
+        AuditEvent::new(
+            request_id,
+            "2026-05-24T12:00:00Z",
+            "codex",
+            ["aws", "sts", "get-caller-identity"],
+            PathBuf::from("/workspace"),
+            "0.1.0",
+            decision,
+        )
+        .with_grants([AuditGrant::new("aws.prod-readonly", "aws.prod", false)])
+    }
+
+    struct TempAuditDir {
+        path: PathBuf,
+    }
+
+    impl TempAuditDir {
+        fn new() -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+            let path = std::env::temp_dir().join(format!(
+                "heim-audit-test-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create temp audit directory");
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempAuditDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
