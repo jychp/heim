@@ -116,13 +116,20 @@ Git repository.
 
 ## Audit Model
 
-`heim-audit` defines typed audit events for future local audit persistence. The
-model records request context, grant/provider names, policy decisions, approval
+`heim-audit` defines typed audit events and an append-only JSONL sink. The model
+records request context, grant/provider names, policy decisions, approval
 metadata, credential issuance timestamps, and redacted credential carrier
 metadata such as environment variable names.
 
-It does not write JSONL or CLI audit output yet. Audit records must never
-contain credential secret values.
+By default, future audit writes target the platform config directory:
+
+- Linux: `$XDG_CONFIG_HOME/heim/logs/audit.jsonl` when `XDG_CONFIG_HOME` is set,
+  otherwise `~/.config/heim/logs/audit.jsonl`
+- macOS: `~/Library/Application Support/heim/logs/audit.jsonl`
+- Windows: `%APPDATA%\heim\logs\audit.jsonl`
+
+Audit records must never contain credential secret values. `heim exec` does not
+emit audit events yet, and `heim audit` does not read them yet.
 
 See `docs/policy.md` and `examples/policy.toml` for the current policy model
 draft.

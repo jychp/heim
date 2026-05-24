@@ -2,8 +2,8 @@
 
 Heim audit events describe local security-relevant decisions and credential
 issuance metadata. The current implementation defines the typed event model in
-`heim-audit`; it does not persist events to JSONL files, expose `heim audit`,
-or emit events from `heim exec` yet.
+`heim-audit` and can append those events to a local JSONL file. It does not
+expose `heim audit` or emit events from `heim exec` yet.
 
 ## Event Scope
 
@@ -39,7 +39,7 @@ The current decision model covers the expected v0 lifecycle:
 - `Failed`
 
 These are event labels only. They do not imply that approval calls, provider
-calls, command execution, or persistence are implemented.
+calls, command execution, or CLI integration are implemented.
 
 ## Credential Metadata
 
@@ -65,6 +65,16 @@ secret store.
 
 ## Persistence
 
-Persistence is intentionally deferred. Future work can add a local JSONL sink
-behind this model without changing policy evaluation or provider issuance code
-first.
+`heim-audit` provides an append-only JSONL sink. Each audit event is serialized
+as one JSON object followed by one newline.
+
+The default audit log file is:
+
+- Linux: `$XDG_CONFIG_HOME/heim/logs/audit.jsonl` when `XDG_CONFIG_HOME` is set,
+  otherwise `~/.config/heim/logs/audit.jsonl`
+- macOS: `~/Library/Application Support/heim/logs/audit.jsonl`
+- Windows: `%APPDATA%\heim\logs\audit.jsonl`
+
+The sink creates the `logs` directory when it writes. Event emission from
+`heim exec` and audit log viewing through `heim audit` are intentionally
+deferred.
