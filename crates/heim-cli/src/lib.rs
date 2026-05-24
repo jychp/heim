@@ -54,17 +54,25 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum PolicyCommand {
-    /// Validate a policy file.
+    /// Validate policy configuration.
     Validate {
-        /// Policy file to validate.
+        /// Single policy file to validate instead of the default policy directory.
+        #[arg(long, conflicts_with = "dir")]
+        file: Option<PathBuf>,
+
+        /// Policy directory to validate instead of the default policy directory.
         #[arg(long)]
-        file: PathBuf,
+        dir: Option<PathBuf>,
     },
-    /// Evaluate one grant request against a policy file.
+    /// Evaluate one grant request against policy configuration.
     Check {
-        /// Policy file to evaluate.
+        /// Single policy file to evaluate instead of the default policy directory.
+        #[arg(long, conflicts_with = "dir")]
+        file: Option<PathBuf>,
+
+        /// Policy directory to evaluate instead of the default policy directory.
         #[arg(long)]
-        file: PathBuf,
+        dir: Option<PathBuf>,
 
         /// Grant name to request.
         grant: String,
@@ -142,7 +150,7 @@ fn run(cli: Cli) -> CommandResult {
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
     match command {
-        Some(PolicyCommand::Validate { file }) => match heim_config::load_policy_file(&file) {
+        Some(PolicyCommand::Validate { file, dir }) => match load_policy_source(file, dir) {
             Ok(document) => ok(format!(
                 "policy: ok ({} grant(s), {} approval transport(s))\n",
                 document.grants.len(),
@@ -156,10 +164,11 @@ fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
         },
         Some(PolicyCommand::Check {
             file,
+            dir,
             grant,
             requester,
             command,
-        }) => match heim_config::load_policy_file(&file) {
+        }) => match load_policy_source(file, dir) {
             Ok(document) => {
                 let request = PolicyRequest::new(grant, requester, command);
                 format_policy_decision(evaluate_policy(&document.grants, &request))
@@ -172,6 +181,21 @@ fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
         },
         None => not_implemented("heim policy is not implemented yet\n"),
     }
+}
+
+fn load_policy_source(
+    file: Option<PathBuf>,
+    dir: Option<PathBuf>,
+) -> Result<heim_config::PolicyDocument, heim_config::ConfigError> {
+    if let Some(file) = file {
+        return heim_config::load_policy_file(file);
+    }
+
+    if let Some(dir) = dir {
+        return heim_config::load_policy_dir(dir);
+    }
+
+    heim_config::load_default_policy_dir()
 }
 
 fn format_policy_decision(decision: PolicyDecision) -> CommandResult {
@@ -307,6 +331,19 @@ mod tests {
     }
 
     #[test]
+    fn policy_validate_reports_valid_directory() {
+        let dir = format!("{}/../../examples/policies", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from(["heim", "policy", "validate", "--dir", &dir]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(
+            result.stdout,
+            "policy: ok (3 grant(s), 1 approval transport(s))\n"
+        );
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
     fn policy_validate_reports_missing_file() {
         let result = run_from([
             "heim",
@@ -344,6 +381,30 @@ mod tests {
             result.stdout,
             "policy: require_approval (transport slack)\n"
         );
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn policy_check_can_evaluate_directory() {
+        let dir = format!("{}/../../examples/policies", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "policy",
+            "check",
+            "--dir",
+            &dir,
+            "github.personal-readonly",
+            "--requester",
+            "gh",
+            "--",
+            "gh",
+            "pr",
+            "view",
+            "42",
+        ]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(result.stdout, "policy: allow\n");
         assert!(result.stderr.is_empty());
     }
 

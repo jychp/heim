@@ -17,6 +17,11 @@ still reflects the current repository state and update it if needed.
 Write code, comments, commit messages, PR text, and technical documentation in
 US English.
 
+## Platform Support
+
+Heim targets Linux and macOS first. Preserve Windows compatibility where it is
+reasonable and does not compromise the Linux and macOS experience.
+
 ## Development Process
 
 When the requested work could encode product behavior, first identify the

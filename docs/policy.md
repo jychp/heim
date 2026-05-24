@@ -8,8 +8,44 @@ typed core model. The policy engine can evaluate one local grant request and
 return `allow`, `deny`, or `require_approval`.
 
 ```bash
+heim policy validate
+heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
+```
+
+## Policy Directory
+
+Heim loads policies from the platform config directory by default:
+
+- Linux: `$XDG_CONFIG_HOME/heim/policies` when `XDG_CONFIG_HOME` is set,
+  otherwise `~/.config/heim/policies`
+- macOS: `~/Library/Application Support/heim/policies`
+- Windows: `%APPDATA%\heim\policies`
+
+The directory may contain one or more `.toml` files. Non-TOML files are
+ignored.
+
+All TOML files are merged before validation. This allows shared approval
+transport configuration to live in one file while grants live in separate
+files.
+
+```text
+$XDG_CONFIG_HOME/heim/policies/
+  approvals.toml
+  aws.toml
+  github.toml
+```
+
+Grant names must be unique across the full directory. Approval transport names
+must also be unique across the full directory.
+
+Files are loaded in sorted path order so diagnostics are stable. Policy meaning
+must not depend on file order because all files are merged before validation.
+
+For local testing, the CLI can still validate an explicit file or directory:
+
+```bash
 heim policy validate --file examples/policy.toml
-heim policy check --file examples/policy.toml aws.prod-readonly --requester codex -- aws sts get-caller-identity
+heim policy validate --dir examples/policies
 ```
 
 ## Grants
@@ -97,7 +133,7 @@ configured once and reused by multiple grants.
 `heim policy check` evaluates one grant request without executing the command:
 
 ```bash
-heim policy check --file examples/policy.toml github.personal-readonly --requester gh -- gh pr view 42
+heim policy check github.personal-readonly --requester gh -- gh pr view 42
 ```
 
 The decision is based on:
