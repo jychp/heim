@@ -130,6 +130,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "heim-config",
+ "heim-policy",
 ]
 
 [[package]]
@@ -152,6 +153,9 @@ version = "0.1.0"
 [[package]]
 name = "heim-policy"
 version = "0.1.0"
+dependencies = [
+ "heim-core",
+]
 
 [[package]]
 name = "heim-providers"

@@ -7,5 +7,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+heim-core = { version = "0.1.0", path = "../heim-core" }
+
 [lints]
 workspace = true

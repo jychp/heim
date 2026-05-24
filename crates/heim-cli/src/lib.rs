@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
+const POLICY_DENIED_EXIT_CODE: i32 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommandResult {
@@ -57,6 +59,23 @@ enum PolicyCommand {
         /// Policy file to validate.
         #[arg(long)]
         file: PathBuf,
+    },
+    /// Evaluate one grant request against a policy file.
+    Check {
+        /// Policy file to evaluate.
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Grant name to request.
+        grant: String,
+
+        /// Requesting binary name.
+        #[arg(long)]
+        requester: String,
+
+        /// Command and arguments to check after `--`.
+        #[arg(required = true, last = true, num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 }
 
@@ -135,8 +154,42 @@ fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
                 stderr: format!("{error}\n"),
             },
         },
+        Some(PolicyCommand::Check {
+            file,
+            grant,
+            requester,
+            command,
+        }) => match heim_config::load_policy_file(&file) {
+            Ok(document) => {
+                let request = PolicyRequest::new(grant, requester, command);
+                format_policy_decision(evaluate_policy(&document.grants, &request))
+            }
+            Err(error) => CommandResult {
+                code: 2,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            },
+        },
         None => not_implemented("heim policy is not implemented yet\n"),
     }
+}
+
+fn format_policy_decision(decision: PolicyDecision) -> CommandResult {
+    match decision {
+        PolicyDecision::Allow => ok("policy: allow\n"),
+        PolicyDecision::RequireApproval { transport } => ok(format!(
+            "policy: require_approval (transport {transport})\n"
+        )),
+        PolicyDecision::Deny { reason } => CommandResult {
+            code: POLICY_DENIED_EXIT_CODE,
+            stdout: String::new(),
+            stderr: format!("policy: deny ({})\n", format_deny_reason(reason)),
+        },
+    }
+}
+
+fn format_deny_reason(reason: DenyReason) -> String {
+    reason.to_string()
 }
 
 fn ok(stdout: impl Into<String>) -> CommandResult {
@@ -266,5 +319,138 @@ mod tests {
         assert_eq!(result.code, 2);
         assert!(result.stdout.is_empty());
         assert!(result.stderr.contains("failed to read policy file"));
+    }
+
+    #[test]
+    fn policy_check_reports_jit_decision() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "policy",
+            "check",
+            "--file",
+            &file,
+            "aws.prod-readonly",
+            "--requester",
+            "codex",
+            "--",
+            "aws",
+            "sts",
+            "get-caller-identity",
+        ]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(
+            result.stdout,
+            "policy: require_approval (transport slack)\n"
+        );
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn policy_check_reports_grant_decision() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "policy",
+            "check",
+            "--file",
+            &file,
+            "github.personal-readonly",
+            "--requester",
+            "gh",
+            "--",
+            "gh",
+            "pr",
+            "view",
+            "42",
+        ]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(result.stdout, "policy: allow\n");
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn policy_check_reports_denial() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "policy",
+            "check",
+            "--file",
+            &file,
+            "github.personal-readonly",
+            "--requester",
+            "codex",
+            "--",
+            "gh",
+            "pr",
+            "view",
+            "42",
+        ]);
+
+        assert_eq!(result.code, 3);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("policy: deny (requester codex is not allowed)")
+        );
+    }
+
+    #[test]
+    fn policy_check_reports_unknown_grant_denial() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "policy",
+            "check",
+            "--file",
+            &file,
+            "aws.missing",
+            "--requester",
+            "codex",
+            "--",
+            "aws",
+            "sts",
+            "get-caller-identity",
+        ]);
+
+        assert_eq!(result.code, 3);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("policy: deny (unknown grant aws.missing)")
+        );
+    }
+
+    #[test]
+    fn policy_check_reports_command_denial() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from([
+            "heim",
+            "policy",
+            "check",
+            "--file",
+            &file,
+            "github.personal-readonly",
+            "--requester",
+            "gh",
+            "--",
+            "gh",
+            "repo",
+            "delete",
+            "drymn/backend",
+        ]);
+
+        assert_eq!(result.code, 3);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("policy: deny (command gh repo delete drymn/backend is not allowed)")
+        );
     }
 }

@@ -14,5 +14,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   wildcards, and grant vs JIT approval modes.
 - Draft policy documentation and example policy configuration.
 - TOML policy loading and `heim policy validate --file <path>`.
+- Local grant policy evaluation and `heim policy check`.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.
