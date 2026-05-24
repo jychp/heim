@@ -25,5 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   directory without storing credential secret values.
 - `heim exec` preflight audit event emission for allow, deny, and
   require-approval policy decisions.
+- `heim exec` command execution for requests fully allowed by local policy,
+  without credential injection yet.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.

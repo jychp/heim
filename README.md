@@ -43,10 +43,10 @@ heim audit
 heim approvals
 ```
 
-Only `doctor`, `policy validate`, `policy check`, `exec` policy preflight,
-`--help`, and `--version` are implemented today. The other commands are parsed
-and return an explicit "not implemented yet" error until their behavior is
-accepted.
+Only `doctor`, `policy validate`, `policy check`, `exec` policy preflight and
+allowed command execution, `--help`, and `--version` are implemented today. The
+other commands are parsed and return an explicit "not implemented yet" error
+until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -103,8 +103,10 @@ heim exec --file examples/policy.toml github.personal-readonly -- gh pr view 42
 
 For `heim exec`, the requester is inferred from the parent process that invoked
 the `heim` binary. Policy evaluation returns `allow`, `deny`, or
-`require_approval`. It does not contact providers, request approvals, issue
-credentials, or execute commands yet.
+`require_approval`. When every requested grant is allowed directly by policy,
+Heim runs the wrapped command without adding credentials and returns the
+command exit code. It does not contact providers, request approvals, or issue
+credentials yet.
 
 The `heim-exec` crate builds the local execution context used by this preflight:
 requested grants, inferred requester, wrapped command, current working

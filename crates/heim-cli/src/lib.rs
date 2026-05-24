@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{ffi::OsStr, fmt};
 
@@ -110,6 +111,7 @@ where
         infer_requester_from_parent_process,
         default_audit_context,
         append_default_audit_event,
+        execute_command,
     )
 }
 
@@ -120,7 +122,13 @@ where
     T: Into<std::ffi::OsString> + Clone,
     F: FnOnce() -> Result<String, RequesterInferenceError>,
 {
-    run_from_with_context(args, infer_requester, test_audit_context, |_| Ok(()))
+    run_from_with_context(
+        args,
+        infer_requester,
+        test_audit_context,
+        |_| Ok(()),
+        test_execute_command,
+    )
 }
 
 fn run_from_with_context<I, T, F, C, A>(
@@ -128,6 +136,7 @@ fn run_from_with_context<I, T, F, C, A>(
     infer_requester: F,
     audit_context: C,
     append_audit_event: A,
+    execute_command: impl FnOnce(&[String]) -> CommandResult,
 ) -> CommandResult
 where
     I: IntoIterator<Item = T>,
@@ -137,7 +146,13 @@ where
     A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
     match Cli::try_parse_from(args) {
-        Ok(cli) => run(cli, infer_requester, audit_context, append_audit_event),
+        Ok(cli) => run(
+            cli,
+            infer_requester,
+            audit_context,
+            append_audit_event,
+            execute_command,
+        ),
         Err(error) => {
             let output = error.to_string();
             if matches!(
@@ -165,6 +180,7 @@ fn run<F, C, A>(
     infer_requester: F,
     audit_context: C,
     append_audit_event: A,
+    execute_command: impl FnOnce(&[String]) -> CommandResult,
 ) -> CommandResult
 where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
@@ -179,13 +195,13 @@ where
             grants,
             command,
         }) => run_exec(
-            file,
-            dir,
+            PolicySource { file, dir },
             grants,
             command,
             infer_requester,
             audit_context,
             append_audit_event,
+            execute_command,
         ),
         Some(Command::Config) => not_implemented("heim config is not implemented yet\n"),
         Some(Command::Policy { command }) => run_policy(command),
@@ -212,20 +228,20 @@ where
 }
 
 fn run_exec<F, C, A>(
-    file: Option<PathBuf>,
-    dir: Option<PathBuf>,
+    policy_source: PolicySource,
     grants: Vec<String>,
     command: Vec<String>,
     infer_requester: F,
     audit_context: C,
     append_audit_event: A,
+    execute_command: impl FnOnce(&[String]) -> CommandResult,
 ) -> CommandResult
 where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
     C: FnOnce() -> AuditContext,
     A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
-    let document = match load_policy_source(file, dir) {
+    let document = match load_policy_source(policy_source) {
         Ok(document) => document,
         Err(error) => {
             return CommandResult {
@@ -274,30 +290,32 @@ where
         };
     }
 
-    format_exec_preflight(preflight)
+    run_exec_preflight(preflight, execute_command)
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
     match command {
-        Some(PolicyCommand::Validate { file, dir }) => match load_policy_source(file, dir) {
-            Ok(document) => ok(format!(
-                "policy: ok ({} grant(s), {} approval transport(s))\n",
-                document.grants.len(),
-                document.approval_transports.len()
-            )),
-            Err(error) => CommandResult {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!("{error}\n"),
-            },
-        },
+        Some(PolicyCommand::Validate { file, dir }) => {
+            match load_policy_source(PolicySource { file, dir }) {
+                Ok(document) => ok(format!(
+                    "policy: ok ({} grant(s), {} approval transport(s))\n",
+                    document.grants.len(),
+                    document.approval_transports.len()
+                )),
+                Err(error) => CommandResult {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: format!("{error}\n"),
+                },
+            }
+        }
         Some(PolicyCommand::Check {
             file,
             dir,
             grant,
             requester,
             command,
-        }) => match load_policy_source(file, dir) {
+        }) => match load_policy_source(PolicySource { file, dir }) {
             Ok(document) => {
                 let request = PolicyRequest::new(grant, requester, command);
                 format_policy_decision(evaluate_policy(&document.grants, &request))
@@ -312,15 +330,19 @@ fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
     }
 }
 
-fn load_policy_source(
+struct PolicySource {
     file: Option<PathBuf>,
     dir: Option<PathBuf>,
+}
+
+fn load_policy_source(
+    source: PolicySource,
 ) -> Result<heim_config::PolicyDocument, heim_config::ConfigError> {
-    if let Some(file) = file {
+    if let Some(file) = source.file {
         return heim_config::load_policy_file(file);
     }
 
-    if let Some(dir) = dir {
+    if let Some(dir) = source.dir {
         return heim_config::load_policy_dir(dir);
     }
 
@@ -380,6 +402,15 @@ fn test_audit_context() -> AuditContext {
     AuditContext {
         request_id: "test-request".to_owned(),
         timestamp: "2026-05-24T12:00:00Z".to_owned(),
+    }
+}
+
+#[cfg(test)]
+fn test_execute_command(_: &[String]) -> CommandResult {
+    CommandResult {
+        code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
     }
 }
 
@@ -462,7 +493,10 @@ fn audit_grants_from_preflight(
         .collect()
 }
 
-fn format_exec_preflight(preflight: ExecutionPreflight) -> CommandResult {
+fn run_exec_preflight(
+    preflight: ExecutionPreflight,
+    execute_command: impl FnOnce(&[String]) -> CommandResult,
+) -> CommandResult {
     if let Some(denial) = preflight.first_denial() {
         let Some(reason) = denial.deny_reason() else {
             return CommandResult {
@@ -487,15 +521,7 @@ fn format_exec_preflight(preflight: ExecutionPreflight) -> CommandResult {
     let approval_transports = preflight.approval_transports();
 
     if approval_transports.is_empty() {
-        CommandResult {
-            code: NOT_IMPLEMENTED_EXIT_CODE,
-            stdout: format!(
-                "exec: preflight allow (requester {}, {} grant(s))\n",
-                preflight.request.requester,
-                preflight.requested_grant_count()
-            ),
-            stderr: "heim exec command execution is not implemented yet\n".to_owned(),
-        }
+        execute_command(&preflight.request.command)
     } else {
         CommandResult {
             code: NOT_IMPLEMENTED_EXIT_CODE,
@@ -510,6 +536,39 @@ fn format_exec_preflight(preflight: ExecutionPreflight) -> CommandResult {
             ),
             stderr: "heim exec approval flow is not implemented yet\n".to_owned(),
         }
+    }
+}
+
+fn execute_command(command: &[String]) -> CommandResult {
+    let Some((program, args)) = command.split_first() else {
+        return CommandResult {
+            code: 1,
+            stdout: String::new(),
+            stderr: "exec: command is empty\n".to_owned(),
+        };
+    };
+
+    let status = match std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => {
+            return CommandResult {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("failed to execute command {program}: {error}\n"),
+            };
+        }
+    };
+
+    CommandResult {
+        code: status.code().unwrap_or(1),
+        stdout: String::new(),
+        stderr: String::new(),
     }
 }
 
@@ -633,6 +692,7 @@ mod tests {
                 *event_sink.borrow_mut() = Some(audit_event.clone());
                 Ok(())
             },
+            super::test_execute_command,
         );
         let event = event.borrow_mut().take().expect("audit event");
 
@@ -735,16 +795,46 @@ mod tests {
             "gh",
         );
 
-        assert_eq!(result.code, 2);
-        assert_eq!(
-            result.stdout,
-            "exec: preflight allow (requester gh, 1 grant(s))\n"
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn exec_runs_allowed_command_and_propagates_exit_code() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+        let result = run_from_with_context(
+            [
+                "heim",
+                "exec",
+                "--file",
+                &file,
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Ok("gh".to_owned()),
+            super::test_audit_context,
+            |_| Ok(()),
+            |command| {
+                *command_sink.borrow_mut() = command.to_vec();
+                super::CommandResult {
+                    code: 17,
+                    stdout: "child stdout\n".to_owned(),
+                    stderr: "child stderr\n".to_owned(),
+                }
+            },
         );
-        assert!(
-            result
-                .stderr
-                .contains("heim exec command execution is not implemented yet")
-        );
+
+        assert_eq!(result.code, 17);
+        assert_eq!(result.stdout, "child stdout\n");
+        assert_eq!(result.stderr, "child stderr\n");
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
     }
 
     #[test]
@@ -854,7 +944,7 @@ mod tests {
             "gh",
         );
 
-        assert_eq!(result.code, 2);
+        assert_eq!(result.code, 0);
         assert_eq!(event.request_id, "test-request");
         assert_eq!(event.requester, "gh");
         assert_eq!(event.command, ["gh", "pr", "view", "42"]);
@@ -948,6 +1038,7 @@ mod tests {
                 let sink = heim_audit::JsonlAuditSink::new("/dev/null/audit.jsonl");
                 sink.append(&sample_audit_event())
             },
+            |_| panic!("command should not execute when audit write fails"),
         );
 
         assert_eq!(result.code, 4);

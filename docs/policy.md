@@ -177,10 +177,13 @@ heim exec --file examples/policy.toml github.personal-readonly -- gh pr view 42
 heim exec --dir examples/policies aws.prod-readonly -- aws sts get-caller-identity
 ```
 
-The current implementation stops after preflight. It returns an explicit
-not-implemented exit code when a request is allowed or requires approval,
-because command execution and approval transport calls are intentionally not
-implemented yet. Denied requests return the policy denial exit code.
+When every requested grant is allowed directly by policy, Heim runs the wrapped
+command without adding credentials and returns the command exit code.
+
+When any requested grant requires approval, Heim still stops after preflight and
+returns an explicit not-implemented exit code because approval transport calls
+are intentionally not implemented yet. Denied requests return the policy denial
+exit code and do not start the wrapped command.
 
 During preflight, Heim also builds a local execution context:
 
@@ -191,7 +194,7 @@ During preflight, Heim also builds a local execution context:
 - Git remote and branch when the command is run inside a Git repository
 
 This context is intended to feed future approval messages, provider requests,
-and audit events. Heim does not persist it, send it to Slack, issue credentials,
-or spawn the wrapped command yet. Git metadata detection is best-effort; Heim
+and audit events. Heim does not send it to Slack, issue credentials, or inject
+environment variables yet. Git metadata detection is best-effort; Heim
 continues without it when `git` is unavailable or the current directory is not a
 Git repository.

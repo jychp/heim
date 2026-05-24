@@ -41,7 +41,7 @@ The current decision model covers the expected v0 lifecycle:
 These are event labels only. They do not imply that approval calls, provider
 calls, command execution, or CLI integration are implemented.
 
-`heim exec` currently emits only the policy preflight decisions:
+`heim exec` currently emits the policy preflight decisions:
 
 - `Allow`
 - `Deny`
@@ -86,5 +86,6 @@ The default audit log file is:
 - Windows: `%APPDATA%\heim\logs\audit.jsonl`
 
 The sink creates the `logs` directory when it writes. `heim exec` fails if it
-cannot write the preflight audit event. Audit log viewing through `heim audit`
-is intentionally deferred.
+cannot write the preflight audit event. For directly allowed requests, the
+audit event is written before the wrapped command starts. Audit log viewing
+through `heim audit` is intentionally deferred.
