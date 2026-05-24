@@ -1,4 +1,6 @@
 # Examples
 
-Example configurations and workflows will live here once the relevant
-specifications are finalized.
+Example configurations and workflows live here while the specification is
+in progress.
+
+- `policy.yaml` shows the current grant policy format.

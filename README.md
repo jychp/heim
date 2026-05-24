@@ -45,6 +45,26 @@ Only `doctor`, `--help`, and `--version` are implemented today. The other
 commands are parsed and return an explicit "not implemented yet" error until
 their behavior is accepted.
 
+## Grant Policy Model
+
+`heim-core` defines the first policy primitives for named JIT credential grants.
+A grant names a temporary credential, such as `aws.prod-readonly` or
+`github.drymn-pr-write`.
+
+Grant policies can express:
+
+- which configured provider backs the grant
+- which requester binaries may ask for it, including `*`
+- which wrapped commands are allowed, including token wildcards such as `aws *`
+- whether access is pre-authorized by policy or requires JIT approval through a
+  configured transport such as `slack`
+
+These are model types only. They do not load config, contact providers, request
+approval, or execute commands yet.
+
+See `docs/policy.md` and `examples/policy.yaml` for the current policy model
+draft.
+
 ## Run Checks
 
 ```bash
@@ -76,8 +96,8 @@ examples/
 docs/
 ```
 
-The product brief is currently kept as a local, ignored project note until the
-specification is finalized.
+The product brief is currently kept as a local, ignored project note while the
+specification is in progress.
 
 ## License
 
