@@ -106,6 +106,14 @@ the `heim` binary. Policy evaluation returns `allow`, `deny`, or
 `require_approval`. It does not contact providers, request approvals, issue
 credentials, or execute commands yet.
 
+The `heim-exec` crate builds the local execution context used by this preflight:
+requested grants, inferred requester, wrapped command, current working
+directory, and Git remote or branch metadata when they can be detected. This
+context is prepared for future approval messages, provider calls, and audit
+events, but it is not persisted yet. Git metadata detection is best-effort; Heim
+continues without it when `git` is unavailable or the current directory is not a
+Git repository.
+
 See `docs/policy.md` and `examples/policy.toml` for the current policy model
 draft.
 

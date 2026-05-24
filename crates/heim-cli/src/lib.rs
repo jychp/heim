@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::{ffi::OsStr, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
@@ -203,13 +203,18 @@ where
         }
     };
 
-    let mut decisions = Vec::with_capacity(grants.len());
-    for grant in grants {
-        let request = PolicyRequest::new(grant.clone(), requester.clone(), command.clone());
-        decisions.push((grant, evaluate_policy(&document.grants, &request)));
-    }
+    let request = match ExecutionRequest::collect(grants, requester, command) {
+        Ok(request) => request,
+        Err(error) => {
+            return CommandResult {
+                code: NOT_IMPLEMENTED_EXIT_CODE,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
 
-    format_exec_preflight(&requester, decisions)
+    format_exec_preflight(evaluate_preflight(&document.grants, request))
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -262,38 +267,37 @@ fn load_policy_source(
     heim_config::load_default_policy_dir()
 }
 
-fn format_exec_preflight(
-    requester: &str,
-    decisions: Vec<(String, PolicyDecision)>,
-) -> CommandResult {
-    if let Some((grant, PolicyDecision::Deny { reason })) = decisions
-        .iter()
-        .find(|(_, decision)| matches!(decision, PolicyDecision::Deny { .. }))
-    {
+fn format_exec_preflight(preflight: ExecutionPreflight) -> CommandResult {
+    if let Some(denial) = preflight.first_denial() {
+        let Some(reason) = denial.deny_reason() else {
+            return CommandResult {
+                code: 1,
+                stdout: String::new(),
+                stderr: "failed to format policy denial\n".to_owned(),
+            };
+        };
+
         return CommandResult {
             code: POLICY_DENIED_EXIT_CODE,
             stdout: String::new(),
             stderr: format!(
-                "exec: deny grant {grant} for requester {requester} ({})\n",
+                "exec: deny grant {} for requester {} ({})\n",
+                denial.grant,
+                preflight.request.requester,
                 format_deny_reason(reason.clone())
             ),
         };
     }
 
-    let approval_transports = decisions
-        .iter()
-        .filter_map(|(_, decision)| match decision {
-            PolicyDecision::RequireApproval { transport } => Some(transport.to_string()),
-            PolicyDecision::Allow | PolicyDecision::Deny { .. } => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let approval_transports = preflight.approval_transports();
 
     if approval_transports.is_empty() {
         CommandResult {
             code: NOT_IMPLEMENTED_EXIT_CODE,
             stdout: format!(
-                "exec: preflight allow (requester {requester}, {} grant(s))\n",
-                decisions.len()
+                "exec: preflight allow (requester {}, {} grant(s))\n",
+                preflight.request.requester,
+                preflight.requested_grant_count()
             ),
             stderr: "heim exec command execution is not implemented yet\n".to_owned(),
         }
@@ -301,9 +305,11 @@ fn format_exec_preflight(
         CommandResult {
             code: NOT_IMPLEMENTED_EXIT_CODE,
             stdout: format!(
-                "exec: preflight require_approval (requester {requester}, transport(s) {})\n",
+                "exec: preflight require_approval (requester {}, transport(s) {})\n",
+                preflight.request.requester,
                 approval_transports
                     .into_iter()
+                    .map(|transport| transport.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),

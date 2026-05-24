@@ -181,3 +181,17 @@ The current implementation stops after preflight. It returns an explicit
 not-implemented exit code when a request is allowed or requires approval,
 because command execution and approval transport calls are intentionally not
 implemented yet. Denied requests return the policy denial exit code.
+
+During preflight, Heim also builds a local execution context:
+
+- requested grant names
+- inferred requester binary
+- wrapped command and arguments
+- current working directory
+- Git remote and branch when the command is run inside a Git repository
+
+This context is intended to feed future approval messages, provider requests,
+and audit events. Heim does not persist it, send it to Slack, issue credentials,
+or spawn the wrapped command yet. Git metadata detection is best-effort; Heim
+continues without it when `git` is unavailable or the current directory is not a
+Git repository.
