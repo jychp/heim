@@ -75,6 +75,13 @@ party actions to commit SHAs once the workflow is finalized.
 
 ## Validation
 
+Before running local checks on a fresh machine, install the required Rust
+components:
+
+```bash
+make setup
+```
+
 Before handing off Rust changes, run:
 
 ```bash

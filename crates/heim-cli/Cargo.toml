@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+
 [[bin]]
 name = "heim"
 path = "src/main.rs"
