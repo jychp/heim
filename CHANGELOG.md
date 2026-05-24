@@ -13,5 +13,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Core grant policy primitives for named grants, requester rules, command
   wildcards, and grant vs JIT approval modes.
 - Draft policy documentation and example policy configuration.
+- TOML policy loading and `heim policy validate --file <path>`.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.

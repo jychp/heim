@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
@@ -38,11 +40,24 @@ enum Command {
     /// Manage Heim configuration.
     Config,
     /// Inspect and test policy definitions.
-    Policy,
+    Policy {
+        #[command(subcommand)]
+        command: Option<PolicyCommand>,
+    },
     /// Inspect local audit events.
     Audit,
     /// Inspect and manage approval requests.
     Approvals,
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Validate a policy file.
+    Validate {
+        /// Policy file to validate.
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 pub fn run_from<I, T>(args: I) -> CommandResult
@@ -83,7 +98,7 @@ fn run(cli: Cli) -> CommandResult {
             command.len()
         )),
         Some(Command::Config) => not_implemented("heim config is not implemented yet\n"),
-        Some(Command::Policy) => not_implemented("heim policy is not implemented yet\n"),
+        Some(Command::Policy { command }) => run_policy(command),
         Some(Command::Audit) => not_implemented("heim audit is not implemented yet\n"),
         Some(Command::Approvals) => not_implemented("heim approvals is not implemented yet\n"),
         None => {
@@ -103,6 +118,24 @@ fn run(cli: Cli) -> CommandResult {
                 stderr: String::new(),
             }
         }
+    }
+}
+
+fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
+    match command {
+        Some(PolicyCommand::Validate { file }) => match heim_config::load_policy_file(&file) {
+            Ok(document) => ok(format!(
+                "policy: ok ({} grant(s), {} approval transport(s))\n",
+                document.grants.len(),
+                document.approval_transports.len()
+            )),
+            Err(error) => CommandResult {
+                code: 2,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            },
+        },
+        None => not_implemented("heim policy is not implemented yet\n"),
     }
 }
 
@@ -189,12 +222,49 @@ mod tests {
 
     #[test]
     fn future_commands_are_parsed_but_not_implemented() {
-        for command in ["config", "policy", "audit", "approvals"] {
+        for command in ["config", "audit", "approvals"] {
             let result = run_from(["heim", command]);
 
             assert_eq!(result.code, 2);
             assert!(result.stdout.is_empty());
             assert!(result.stderr.contains("not implemented yet"));
         }
+    }
+
+    #[test]
+    fn policy_without_subcommand_is_not_implemented_yet() {
+        let result = run_from(["heim", "policy"]);
+
+        assert_eq!(result.code, 2);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.contains("not implemented yet"));
+    }
+
+    #[test]
+    fn policy_validate_reports_valid_file() {
+        let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let result = run_from(["heim", "policy", "validate", "--file", &file]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(
+            result.stdout,
+            "policy: ok (3 grant(s), 1 approval transport(s))\n"
+        );
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn policy_validate_reports_missing_file() {
+        let result = run_from([
+            "heim",
+            "policy",
+            "validate",
+            "--file",
+            "missing-policy.toml",
+        ]);
+
+        assert_eq!(result.code, 2);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.contains("failed to read policy file"));
     }
 }

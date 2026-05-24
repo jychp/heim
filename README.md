@@ -37,13 +37,14 @@ heim doctor
 heim exec <grant> [<grant> ...] -- <command> [args...]
 heim config
 heim policy
+heim policy validate --file examples/policy.toml
 heim audit
 heim approvals
 ```
 
-Only `doctor`, `--help`, and `--version` are implemented today. The other
-commands are parsed and return an explicit "not implemented yet" error until
-their behavior is accepted.
+Only `doctor`, `policy validate`, `--help`, and `--version` are implemented
+today. The other commands are parsed and return an explicit "not implemented
+yet" error until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -62,7 +63,13 @@ Grant policies can express:
 These are model types only. They do not load config, contact providers, request
 approval, or execute commands yet.
 
-See `docs/policy.md` and `examples/policy.yaml` for the current policy model
+Policy files can be loaded and validated:
+
+```bash
+heim policy validate --file examples/policy.toml
+```
+
+See `docs/policy.md` and `examples/policy.toml` for the current policy model
 draft.
 
 ## Run Checks

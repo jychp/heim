@@ -3,7 +3,12 @@
 Heim policy describes which temporary credential grants can be requested, who
 may request them, which commands may run with them, and how approval is decided.
 
-The policy loader and runtime evaluation are not implemented yet.
+The policy loader validates TOML policy documents and converts grants into the
+typed core model. Runtime policy evaluation is not implemented yet.
+
+```bash
+heim policy validate --file examples/policy.toml
+```
 
 ## Grants
 
@@ -17,29 +22,22 @@ github.personal-readonly
 
 Each grant points to a configured provider and defines local policy constraints.
 
-```yaml
-grants:
-  aws.prod-readonly:
-    provider: aws.prod
-    requesters:
-      - binary: codex
-    commands:
-      - "aws *"
-    approval:
-      mode: jit
-      transport: slack
+```toml
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws.prod"
+allow = ["codex"]
+commands = ["aws *"]
+approval = "jit:slack"
 ```
 
-## Requesters
+## Allow
 
 A requester is the local binary asking Heim for a grant. The v0 model supports
 binary-name rules and an explicit wildcard.
 
-```yaml
-requesters:
-  - binary: codex
-  - binary: claude-code
-  - binary: "*"
+```toml
+allow = ["codex", "claude-code", "*"]
 ```
 
 `*` means any requester binary may ask for the grant, subject to the rest of the
@@ -50,10 +48,8 @@ grant policy.
 Command rules constrain which wrapped command may receive credentials from the
 grant.
 
-```yaml
-commands:
-  - "aws *"
-  - "gh pr view *"
+```toml
+commands = ["aws *", "gh pr view *"]
 ```
 
 The current wildcard model is intentionally small:
@@ -72,27 +68,23 @@ Approval has two modes.
 `grant` means policy grants access directly when requester and command rules
 match.
 
-```yaml
-approval:
-  mode: grant
+```toml
+approval = "grant"
 ```
 
 `jit` means Heim must request approval at execution time through a configured
 transport.
 
-```yaml
-approval:
-  mode: jit
-  transport: slack
+```toml
+approval = "jit:slack"
 ```
 
 The transport name references a separate transport configuration.
 
-```yaml
-approval_transports:
-  slack:
-    type: slack
-    channel: "#heim-approvals"
+```toml
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
 ```
 
 Transport configuration is intentionally separate from grants so Slack can be
