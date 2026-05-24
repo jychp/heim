@@ -184,6 +184,9 @@ version = "0.1.0"
 [[package]]
 name = "heim-sources"
 version = "0.1.0"
+dependencies = [
+ "heim-config",
+]
 
 [[package]]
 name = "indexmap"

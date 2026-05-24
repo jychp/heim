@@ -137,3 +137,22 @@ heim config validate --file examples/config.toml --auth-file ~/.config/heim/.aut
 
 Secret values from `.auth.json` must never be written to logs, audit events, or
 error messages.
+
+## Secret Source Resolution
+
+The `heim-sources` crate can resolve unsafe local auth references from a
+validated `.auth.json` file into typed secret material:
+
+- GitHub App private keys
+- GitHub PATs
+
+It can also resolve the local secrets required by one configured provider:
+GitHub App providers require a private key, GitHub PAT providers require a
+token, and AWS STS providers require no unsafe local auth secret.
+
+This is only a source boundary for future provider implementations. It does not
+call GitHub, mint tokens, inject environment variables, or wire secrets into
+`heim exec` yet.
+
+Resolved secrets redact their values in `Debug` output. Error messages include
+auth entry names and secret types only, never secret values.
