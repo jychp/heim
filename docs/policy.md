@@ -195,9 +195,12 @@ wrapped command only.
 
 When any requested grant requires approval, Heim loads config, validates the
 referenced approval transport, builds one approval request per transport, and
-then returns an explicit not-implemented exit code because approval transport
-calls are intentionally not implemented yet. Denied requests return the policy
-denial exit code and do not start the wrapped command.
+asks an approval provider for a decision. Approved decisions continue to
+credential issuance and command execution. Denied, timed-out, unavailable, or
+invalid approval decisions fail closed and do not start the wrapped command.
+The default runtime currently fails closed because built-in approval transport
+dispatch is intentionally not implemented yet. Denied policy requests return
+the policy denial exit code and do not start the wrapped command.
 
 During preflight, Heim also builds a local execution context:
 

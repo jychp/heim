@@ -4,7 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{ffi::OsStr, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
-use heim_approvals::{ApprovalGitContext, ApprovalGrant, ApprovalRequest};
+use heim_approvals::{
+    ApprovalDecision, ApprovalError, ApprovalGitContext, ApprovalGrant, ApprovalProvider,
+    ApprovalRequest,
+};
 use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
@@ -147,6 +150,7 @@ where
         args,
         infer_requester_from_parent_process,
         default_audit_context,
+        UnsupportedApprovalProvider,
         append_default_audit_event,
         execute_command,
     )
@@ -163,6 +167,7 @@ where
         args,
         infer_requester,
         test_audit_context,
+        UnsupportedApprovalProvider,
         |_| Ok(()),
         test_execute_command,
     )
@@ -172,6 +177,7 @@ fn run_from_with_context<I, T, F, C, A>(
     args: I,
     infer_requester: F,
     audit_context: C,
+    approval_provider: impl ApprovalProvider,
     append_audit_event: A,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
@@ -182,11 +188,38 @@ where
     C: FnOnce() -> AuditContext,
     A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
+    run_from_with_context_and_approvals(
+        args,
+        infer_requester,
+        audit_context,
+        approval_provider,
+        append_audit_event,
+        execute_command,
+    )
+}
+
+fn run_from_with_context_and_approvals<I, T, F, C, A, P>(
+    args: I,
+    infer_requester: F,
+    audit_context: C,
+    approval_provider: P,
+    append_audit_event: A,
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
+) -> CommandResult
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+    F: FnOnce() -> Result<String, RequesterInferenceError>,
+    C: FnOnce() -> AuditContext,
+    A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
+    P: ApprovalProvider,
+{
     match Cli::try_parse_from(args) {
         Ok(cli) => run(
             cli,
             infer_requester,
             audit_context,
+            approval_provider,
             append_audit_event,
             execute_command,
         ),
@@ -216,6 +249,7 @@ fn run<F, C, A>(
     cli: Cli,
     infer_requester: F,
     audit_context: C,
+    approval_provider: impl ApprovalProvider,
     append_audit_event: A,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
@@ -245,6 +279,7 @@ where
             },
             infer_requester,
             audit_context,
+            approval_provider,
             append_audit_event,
             execute_command,
         ),
@@ -276,6 +311,7 @@ fn run_exec<F, C, A>(
     cli_request: ExecCliRequest,
     infer_requester: F,
     audit_context: C,
+    approval_provider: impl ApprovalProvider,
     append_audit_event: A,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
@@ -341,25 +377,67 @@ where
             Vec::new()
         };
 
-    let credentials =
-        if preflight.first_denial().is_none() && preflight.approval_transports().is_empty() {
-            match issue_credentials_for_preflight(
-                &preflight,
-                &document.grants,
-                cli_request.config_source,
-            ) {
-                Ok(credentials) => credentials,
-                Err(error) => {
-                    return CommandResult {
-                        code: CREDENTIAL_ERROR_EXIT_CODE,
-                        stdout: String::new(),
-                        stderr: format!("failed to issue credentials: {error}\n"),
-                    };
-                }
+    if preflight.first_denial().is_none() && !approval_requests.is_empty() {
+        let event = audit_event_from_preflight(
+            &preflight,
+            &document.grants,
+            &[],
+            context,
+            env!("CARGO_PKG_VERSION"),
+        );
+
+        if let Err(error) = append_audit_event(&event) {
+            return CommandResult {
+                code: AUDIT_ERROR_EXIT_CODE,
+                stdout: String::new(),
+                stderr: format!("failed to write exec audit event: {error}\n"),
+            };
+        }
+
+        if let Err(error) = apply_approval_requests(&approval_provider, &approval_requests) {
+            return CommandResult {
+                code: APPROVAL_ERROR_EXIT_CODE,
+                stdout: String::new(),
+                stderr: format!("failed to obtain approval: {error}\n"),
+            };
+        }
+
+        let credentials = match issue_credentials_for_preflight(
+            &preflight,
+            &document.grants,
+            cli_request.config_source,
+        ) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                return CommandResult {
+                    code: CREDENTIAL_ERROR_EXIT_CODE,
+                    stdout: String::new(),
+                    stderr: format!("failed to issue credentials: {error}\n"),
+                };
             }
-        } else {
-            Vec::new()
         };
+
+        return execute_preflight_command(&preflight, &credentials, execute_command);
+    }
+
+    let credentials = if preflight.first_denial().is_none() {
+        match issue_credentials_for_preflight(
+            &preflight,
+            &document.grants,
+            cli_request.config_source,
+        ) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                return CommandResult {
+                    code: CREDENTIAL_ERROR_EXIT_CODE,
+                    stdout: String::new(),
+                    stderr: format!("failed to issue credentials: {error}\n"),
+                };
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let event = audit_event_from_preflight(
         &preflight,
         &document.grants,
@@ -376,7 +454,7 @@ where
         };
     }
 
-    run_exec_preflight(preflight, credentials, approval_requests, execute_command)
+    run_exec_preflight(preflight, credentials, execute_command)
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -679,7 +757,6 @@ fn audit_grants_from_preflight(
 fn run_exec_preflight(
     preflight: ExecutionPreflight,
     credentials: Vec<IssuedGrantCredential>,
-    _approval_requests: Vec<ApprovalRequest>,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult {
     if let Some(denial) = preflight.first_denial() {
@@ -706,12 +783,7 @@ fn run_exec_preflight(
     let approval_transports = preflight.approval_transports();
 
     if approval_transports.is_empty() {
-        let env_vars = credentials
-            .iter()
-            .flat_map(|credential| credential.credential.env_vars())
-            .cloned()
-            .collect::<Vec<_>>();
-        execute_command(&preflight.request.command, &env_vars)
+        execute_preflight_command(&preflight, &credentials, execute_command)
     } else {
         CommandResult {
             code: NOT_IMPLEMENTED_EXIT_CODE,
@@ -727,6 +799,19 @@ fn run_exec_preflight(
             stderr: "heim exec approval flow is not implemented yet\n".to_owned(),
         }
     }
+}
+
+fn execute_preflight_command(
+    preflight: &ExecutionPreflight,
+    credentials: &[IssuedGrantCredential],
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
+) -> CommandResult {
+    let env_vars = credentials
+        .iter()
+        .flat_map(|credential| credential.credential.env_vars())
+        .cloned()
+        .collect::<Vec<_>>();
+    execute_command(&preflight.request.command, &env_vars)
 }
 
 fn execute_command(command: &[String], env_vars: &[CredentialEnvVar]) -> CommandResult {
@@ -760,6 +845,63 @@ fn execute_command(command: &[String], env_vars: &[CredentialEnvVar]) -> Command
         code: status.code().unwrap_or(1),
         stdout: String::new(),
         stderr: String::new(),
+    }
+}
+
+struct UnsupportedApprovalProvider;
+
+impl ApprovalProvider for UnsupportedApprovalProvider {
+    fn request_approval(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Err(ApprovalError::TransportUnavailable {
+            transport: request.transport.clone(),
+            message: "approval dispatch is not implemented yet".to_owned(),
+        })
+    }
+}
+
+fn apply_approval_requests(
+    provider: &impl ApprovalProvider,
+    requests: &[ApprovalRequest],
+) -> Result<(), ExecApprovalError> {
+    for request in requests {
+        let decision = provider
+            .request_approval(request)
+            .map_err(ExecApprovalError::ApprovalProvider)?;
+        validate_approval_decision(request, decision)?;
+    }
+
+    Ok(())
+}
+
+fn validate_approval_decision(
+    request: &ApprovalRequest,
+    decision: ApprovalDecision,
+) -> Result<(), ExecApprovalError> {
+    match decision {
+        ApprovalDecision::Approved(_) => Ok(()),
+        ApprovalDecision::ApprovedWithOption { option, .. } => {
+            if request
+                .options
+                .iter()
+                .any(|candidate| candidate.id == option.id)
+            {
+                Ok(())
+            } else {
+                Err(ExecApprovalError::UnconfiguredApprovalOption {
+                    transport: request.transport.to_string(),
+                    option: option.id,
+                })
+            }
+        }
+        ApprovalDecision::Denied(_) => Err(ExecApprovalError::ApprovalDenied {
+            transport: request.transport.to_string(),
+        }),
+        ApprovalDecision::TimedOut => Err(ExecApprovalError::ApprovalTimedOut {
+            transport: request.transport.to_string(),
+        }),
     }
 }
 
@@ -942,9 +1084,13 @@ fn approval_grants_for_transport(
 enum ExecApprovalError {
     LoadConfig(heim_config::ConfigError),
     BuildRequest(heim_approvals::ApprovalRequestBuildError),
+    ApprovalProvider(heim_approvals::ApprovalError),
     MissingGrant { grant: String },
     MissingProviderConfig { grant: String, provider: String },
     MissingApprovalTransport { transport: String },
+    ApprovalDenied { transport: String },
+    ApprovalTimedOut { transport: String },
+    UnconfiguredApprovalOption { transport: String, option: String },
 }
 
 impl fmt::Display for ExecApprovalError {
@@ -952,6 +1098,7 @@ impl fmt::Display for ExecApprovalError {
         match self {
             Self::LoadConfig(source) => write!(formatter, "{source}"),
             Self::BuildRequest(source) => write!(formatter, "{source}"),
+            Self::ApprovalProvider(source) => write!(formatter, "{source}"),
             Self::MissingGrant { grant } => {
                 write!(
                     formatter,
@@ -966,6 +1113,16 @@ impl fmt::Display for ExecApprovalError {
                 formatter,
                 "approval transport {transport} is required by policy but is not configured"
             ),
+            Self::ApprovalDenied { transport } => {
+                write!(formatter, "approval request was denied by {transport}")
+            }
+            Self::ApprovalTimedOut { transport } => {
+                write!(formatter, "approval request timed out on {transport}")
+            }
+            Self::UnconfiguredApprovalOption { transport, option } => write!(
+                formatter,
+                "approval transport {transport} returned unconfigured option {option}"
+            ),
         }
     }
 }
@@ -975,9 +1132,13 @@ impl std::error::Error for ExecApprovalError {
         match self {
             Self::LoadConfig(source) => Some(source),
             Self::BuildRequest(source) => Some(source),
+            Self::ApprovalProvider(source) => Some(source),
             Self::MissingGrant { .. }
             | Self::MissingProviderConfig { .. }
-            | Self::MissingApprovalTransport { .. } => None,
+            | Self::MissingApprovalTransport { .. }
+            | Self::ApprovalDenied { .. }
+            | Self::ApprovalTimedOut { .. }
+            | Self::UnconfiguredApprovalOption { .. } => None,
         }
     }
 }
@@ -1115,15 +1276,21 @@ fn process_name(name: &OsStr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use heim_approvals::{
+        ApprovalDecision, ApprovalError, ApprovalGrantDecision, ApprovalOption, ApprovalProvider,
+        ApprovalRequest,
+    };
     use heim_audit::AuditDecision;
 
     use super::{
-        RequesterInferenceError, run_from, run_from_with_context, run_from_with_requester,
+        RequesterInferenceError, run_from, run_from_with_context,
+        run_from_with_context_and_approvals, run_from_with_requester,
     };
 
     fn run_from_requester<I, T>(args: I, requester: &str) -> super::CommandResult
@@ -1148,6 +1315,7 @@ mod tests {
             args,
             || Ok(requester.to_owned()),
             super::test_audit_context,
+            super::UnsupportedApprovalProvider,
             |audit_event| {
                 *event_sink.borrow_mut() = Some(audit_event.clone());
                 Ok(())
@@ -1305,15 +1473,12 @@ approval = "grant"
             "codex",
         );
 
-        assert_eq!(result.code, 2);
-        assert_eq!(
-            result.stdout,
-            "exec: preflight require_approval (requester codex, transport(s) slack)\n"
-        );
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
         assert!(
             result
                 .stderr
-                .contains("heim exec approval flow is not implemented yet")
+                .contains("approval transport slack is unavailable")
         );
     }
 
@@ -1375,6 +1540,7 @@ approval = "grant"
             ],
             || Ok("gh".to_owned()),
             super::test_audit_context,
+            super::UnsupportedApprovalProvider,
             |_| Ok(()),
             |command, env_vars| {
                 *command_sink.borrow_mut() = command.to_vec();
@@ -1454,15 +1620,12 @@ approval = "grant"
             "gh",
         );
 
-        assert_eq!(result.code, 2);
-        assert_eq!(
-            result.stdout,
-            "exec: preflight require_approval (requester gh, transport(s) slack)\n"
-        );
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
         assert!(
             result
                 .stderr
-                .contains("heim exec approval flow is not implemented yet")
+                .contains("approval transport slack is unavailable")
         );
     }
 
@@ -1587,7 +1750,7 @@ approval = "grant"
             "codex",
         );
 
-        assert_eq!(result.code, 2);
+        assert_eq!(result.code, 6);
         assert_eq!(
             event.decision,
             AuditDecision::RequireApproval {
@@ -1715,6 +1878,7 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
             ],
             || Ok("codex".to_owned()),
             super::test_audit_context,
+            super::UnsupportedApprovalProvider,
             |_| Ok(()),
             |_, _| panic!("command should not execute without approval transport config"),
         );
@@ -1725,6 +1889,141 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
             result
                 .stderr
                 .contains("approval transport slack is required by policy but is not configured")
+        );
+    }
+
+    #[test]
+    fn exec_runs_command_after_approval() {
+        let seen_requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = TestApprovalProvider::new(
+            [Ok(ApprovalDecision::Approved(ApprovalGrantDecision::new(
+                "alice",
+                "2026-05-24T12:00:00Z",
+            )))],
+            Rc::clone(&seen_requests),
+        );
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+        let env_seen = Rc::new(RefCell::new(Vec::new()));
+        let env_sink = Rc::clone(&env_seen);
+
+        let result = run_jit_github_exec(provider, |command, env_vars| {
+            *command_sink.borrow_mut() = command.to_vec();
+            *env_sink.borrow_mut() = env_vars
+                .iter()
+                .map(|env| (env.name().to_owned(), env.value().to_owned()))
+                .collect();
+            super::CommandResult {
+                code: 17,
+                stdout: "child stdout\n".to_owned(),
+                stderr: "child stderr\n".to_owned(),
+            }
+        });
+
+        assert_eq!(result.code, 17);
+        assert_eq!(result.stdout, "child stdout\n");
+        assert_eq!(result.stderr, "child stderr\n");
+        assert_eq!(seen_requests.borrow().as_slice(), ["test-request"]);
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+        assert_eq!(
+            env_seen.borrow().as_slice(),
+            [
+                ("GH_TOKEN".to_owned(), "ghp_secret".to_owned()),
+                ("GITHUB_TOKEN".to_owned(), "ghp_secret".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_runs_command_after_approval_with_configured_option() {
+        let provider = TestApprovalProvider::new(
+            [Ok(ApprovalDecision::ApprovedWithOption {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                option: ApprovalOption::new("15m", "Approve 15m"),
+            })],
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+
+        let result = run_jit_github_exec(provider, |command, _| {
+            *command_sink.borrow_mut() = command.to_vec();
+            super::CommandResult {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        });
+
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+    }
+
+    #[test]
+    fn exec_fails_closed_when_approval_option_is_not_configured() {
+        let provider = TestApprovalProvider::new(
+            [Ok(ApprovalDecision::ApprovedWithOption {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                option: ApprovalOption::new("24h", "Approve 24h"),
+            })],
+            Rc::new(RefCell::new(Vec::new())),
+        );
+
+        let result = run_jit_github_exec(provider, |_, _| {
+            panic!("command should not execute with an unconfigured approval option")
+        });
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval transport slack returned unconfigured option 24h")
+        );
+    }
+
+    #[test]
+    fn exec_fails_closed_when_approval_is_denied() {
+        let provider = TestApprovalProvider::new(
+            [Ok(ApprovalDecision::Denied(ApprovalGrantDecision::new(
+                "alice",
+                "2026-05-24T12:00:00Z",
+            )))],
+            Rc::new(RefCell::new(Vec::new())),
+        );
+
+        let result = run_jit_github_exec(provider, |_, _| {
+            panic!("command should not execute when approval is denied")
+        });
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval request was denied by slack")
+        );
+    }
+
+    #[test]
+    fn exec_fails_closed_when_approval_times_out() {
+        let provider = TestApprovalProvider::new(
+            [Ok(ApprovalDecision::TimedOut)],
+            Rc::new(RefCell::new(Vec::new())),
+        );
+
+        let result = run_jit_github_exec(provider, |_, _| {
+            panic!("command should not execute when approval times out")
+        });
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval request timed out on slack")
         );
     }
 
@@ -1752,6 +2051,7 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
             ],
             || Ok("gh".to_owned()),
             super::test_audit_context,
+            super::UnsupportedApprovalProvider,
             |_| {
                 let sink = heim_audit::JsonlAuditSink::new("/dev/null/audit.jsonl");
                 sink.append(&sample_audit_event())
@@ -1794,6 +2094,7 @@ approval = "grant"
             ],
             || Ok("codex".to_owned()),
             super::test_audit_context,
+            super::UnsupportedApprovalProvider,
             |_| Ok(()),
             |_, _| panic!("command should not execute when provider cannot issue credentials"),
         );
@@ -2057,6 +2358,99 @@ approval = "grant"
             env!("CARGO_PKG_VERSION"),
             AuditDecision::Allow,
         )
+    }
+
+    fn run_jit_github_exec<P>(
+        approval_provider: P,
+        execute_command: impl FnOnce(
+            &[String],
+            &[heim_providers::CredentialEnvVar],
+        ) -> super::CommandResult,
+    ) -> super::CommandResult
+    where
+        P: ApprovalProvider,
+    {
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "github.personal-readonly"
+provider = "github_personal"
+allow = ["gh"]
+commands = ["gh pr view *"]
+approval = "jit:slack"
+"#,
+        );
+        let config = TestFile::new(
+            "config",
+            r##"
+[providers.github_personal]
+type = "github_pat"
+token = { auth = "github_personal_pat" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "60m"]
+"##,
+        );
+        let auth = TestFile::unsafe_auth_file();
+
+        run_from_with_context_and_approvals(
+            [
+                "heim",
+                "exec",
+                "--file",
+                policy.path().to_str().expect("utf-8 path"),
+                "--config-file",
+                config.path().to_str().expect("utf-8 path"),
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Ok("gh".to_owned()),
+            super::test_audit_context,
+            approval_provider,
+            |_| Ok(()),
+            execute_command,
+        )
+    }
+
+    struct TestApprovalProvider {
+        decisions: RefCell<VecDeque<Result<ApprovalDecision, ApprovalError>>>,
+        seen_requests: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl TestApprovalProvider {
+        fn new(
+            decisions: impl IntoIterator<Item = Result<ApprovalDecision, ApprovalError>>,
+            seen_requests: Rc<RefCell<Vec<String>>>,
+        ) -> Self {
+            Self {
+                decisions: RefCell::new(decisions.into_iter().collect()),
+                seen_requests,
+            }
+        }
+    }
+
+    impl ApprovalProvider for TestApprovalProvider {
+        fn request_approval(
+            &self,
+            request: &ApprovalRequest,
+        ) -> Result<ApprovalDecision, ApprovalError> {
+            self.seen_requests
+                .borrow_mut()
+                .push(request.request_id.clone());
+            self.decisions
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(ApprovalDecision::TimedOut))
+        }
     }
 
     struct TestFile {
