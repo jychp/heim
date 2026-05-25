@@ -135,6 +135,10 @@ channel = "#heim-approvals"
 Transport configuration is intentionally separate from grants so Slack can be
 configured once and reused by multiple grants.
 
+The approval runtime contract is transport-neutral. Slack is the first planned
+v0 transport, but future transports can implement the same request and decision
+model without changing grant policy syntax.
+
 ## Evaluation
 
 `heim policy check` evaluates one grant request without executing the command:
