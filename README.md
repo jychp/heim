@@ -64,8 +64,8 @@ Grant policies can express:
 - whether access is pre-authorized by policy or requires JIT approval through a
   configured transport such as `slack`
 
-These are model types only. They do not load config, contact providers, request
-approval, or execute commands yet.
+Policy evaluation can drive local preflight and allowed command execution.
+Heim does not request approval yet when JIT approval is required.
 
 Policy files are loaded from the platform config directory by default:
 

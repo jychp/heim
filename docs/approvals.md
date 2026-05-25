@@ -1,0 +1,66 @@
+# Approval Contract
+
+Heim approvals are modeled as transport-neutral requests and decisions. A
+transport can be Slack, a future CLI prompt, a ticketing system, or another
+approval backend.
+
+The current implementation defines the contract in `heim-approvals`. It does
+not call Slack or any external approval system yet.
+
+## Request
+
+An approval request contains the context a human approver needs:
+
+- request id
+- approval transport name
+- requested grants and their configured providers
+- requester binary
+- wrapped command and arguments
+- current working directory
+- Git remote and branch when detected
+
+This mirrors the local context already collected by `heim exec` for preflight,
+audit, and future provider requests.
+
+`heim-approvals` also exposes a request builder for callers that already have
+this context. The builder validates that a request has at least one grant, a
+request id, requester, command, and current working directory before it can be
+sent to a transport.
+
+## Decision
+
+An approval provider returns a transport-neutral decision:
+
+- `approved` with approver and decision timestamp metadata
+- `denied` with approver and decision timestamp metadata
+- `timed_out`
+
+Transport failures are separate errors. The default product posture remains
+fail closed: when approval cannot be obtained, Heim must not start the wrapped
+command or issue credentials.
+
+## Transports
+
+Policy references transports by name:
+
+```toml
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws_prod"
+allow = ["codex"]
+commands = ["aws *"]
+approval = "jit:slack"
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+```
+
+Slack is the first planned v0 transport. The contract intentionally does not
+encode Slack-only fields in the common request or decision types.
+
+## Current Limitations
+
+`heim exec` still stops after policy preflight when a grant requires JIT
+approval. Runtime approval dispatch, Slack API calls, approval timeouts, and
+post-approval credential issuance are intentionally deferred.

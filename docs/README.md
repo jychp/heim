@@ -6,3 +6,4 @@ Project documentation lives here while the specification is in progress.
 - `config.md` describes provider configuration and the unsafe local auth file
   schema.
 - `audit.md` describes the current audit event model and JSONL sink.
+- `approvals.md` describes the approval provider contract.
