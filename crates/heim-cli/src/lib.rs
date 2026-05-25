@@ -7,10 +7,16 @@ use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
+use heim_providers::{
+    CredentialEnvVar, CredentialProvider, CredentialRequest, GithubPatProvider, IssuedCredential,
+    ProviderGitContext,
+};
+use heim_sources::{ProviderLocalSecrets, SecretSource, UnsafeLocalAuthSource};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
 const POLICY_DENIED_EXIT_CODE: i32 = 3;
 const AUDIT_ERROR_EXIT_CODE: i32 = 4;
+const CREDENTIAL_ERROR_EXIT_CODE: i32 = 5;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommandResult {
@@ -44,6 +50,14 @@ enum Command {
         /// Policy directory to evaluate instead of the default policy directory.
         #[arg(long)]
         dir: Option<PathBuf>,
+
+        /// Config file to use instead of the default config file.
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+
+        /// Unsafe local auth file to use instead of the default auth file.
+        #[arg(long)]
+        auth_file: Option<PathBuf>,
 
         /// Grant names to request for the command.
         #[arg(required = true, num_args = 1..)]
@@ -157,7 +171,7 @@ fn run_from_with_context<I, T, F, C, A>(
     infer_requester: F,
     audit_context: C,
     append_audit_event: A,
-    execute_command: impl FnOnce(&[String]) -> CommandResult,
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
 where
     I: IntoIterator<Item = T>,
@@ -201,7 +215,7 @@ fn run<F, C, A>(
     infer_requester: F,
     audit_context: C,
     append_audit_event: A,
-    execute_command: impl FnOnce(&[String]) -> CommandResult,
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
 where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
@@ -213,12 +227,20 @@ where
         Some(Command::Exec {
             file,
             dir,
+            config_file,
+            auth_file,
             grants,
             command,
         }) => run_exec(
-            PolicySource { file, dir },
-            grants,
-            command,
+            ExecCliRequest {
+                policy_source: PolicySource { file, dir },
+                config_source: ConfigSource {
+                    file: config_file,
+                    auth_file,
+                },
+                grants,
+                command,
+            },
             infer_requester,
             audit_context,
             append_audit_event,
@@ -249,20 +271,18 @@ where
 }
 
 fn run_exec<F, C, A>(
-    policy_source: PolicySource,
-    grants: Vec<String>,
-    command: Vec<String>,
+    cli_request: ExecCliRequest,
     infer_requester: F,
     audit_context: C,
     append_audit_event: A,
-    execute_command: impl FnOnce(&[String]) -> CommandResult,
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
 where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
     C: FnOnce() -> AuditContext,
     A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
-    let document = match load_policy_source(policy_source) {
+    let document = match load_policy_source(cli_request.policy_source) {
         Ok(document) => document,
         Err(error) => {
             return CommandResult {
@@ -284,21 +304,42 @@ where
         }
     };
 
-    let request = match ExecutionRequest::collect(grants, requester, command) {
-        Ok(request) => request,
-        Err(error) => {
-            return CommandResult {
-                code: NOT_IMPLEMENTED_EXIT_CODE,
-                stdout: String::new(),
-                stderr: format!("{error}\n"),
-            };
-        }
-    };
+    let request =
+        match ExecutionRequest::collect(cli_request.grants, requester, cli_request.command) {
+            Ok(request) => request,
+            Err(error) => {
+                return CommandResult {
+                    code: NOT_IMPLEMENTED_EXIT_CODE,
+                    stdout: String::new(),
+                    stderr: format!("{error}\n"),
+                };
+            }
+        };
 
     let preflight = evaluate_preflight(&document.grants, request);
+    let credentials =
+        if preflight.first_denial().is_none() && preflight.approval_transports().is_empty() {
+            match issue_credentials_for_preflight(
+                &preflight,
+                &document.grants,
+                cli_request.config_source,
+            ) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    return CommandResult {
+                        code: CREDENTIAL_ERROR_EXIT_CODE,
+                        stdout: String::new(),
+                        stderr: format!("failed to issue credentials: {error}\n"),
+                    };
+                }
+            }
+        } else {
+            Vec::new()
+        };
     let event = audit_event_from_preflight(
         &preflight,
         &document.grants,
+        &credentials,
         audit_context(),
         env!("CARGO_PKG_VERSION"),
     );
@@ -311,7 +352,7 @@ where
         };
     }
 
-    run_exec_preflight(preflight, execute_command)
+    run_exec_preflight(preflight, credentials, execute_command)
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -419,6 +460,18 @@ struct PolicySource {
     dir: Option<PathBuf>,
 }
 
+struct ConfigSource {
+    file: Option<PathBuf>,
+    auth_file: Option<PathBuf>,
+}
+
+struct ExecCliRequest {
+    policy_source: PolicySource,
+    config_source: ConfigSource,
+    grants: Vec<String>,
+    command: Vec<String>,
+}
+
 fn load_policy_source(
     source: PolicySource,
 ) -> Result<heim_config::PolicyDocument, heim_config::ConfigError> {
@@ -431,6 +484,15 @@ fn load_policy_source(
     }
 
     heim_config::load_default_policy_dir()
+}
+
+fn load_config_source(
+    source: &ConfigSource,
+) -> Result<heim_config::HeimConfig, heim_config::ConfigError> {
+    match &source.file {
+        Some(file) => heim_config::load_config_file(file),
+        None => heim_config::load_default_config_file(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,7 +552,7 @@ fn test_audit_context() -> AuditContext {
 }
 
 #[cfg(test)]
-fn test_execute_command(_: &[String]) -> CommandResult {
+fn test_execute_command(_: &[String], _: &[CredentialEnvVar]) -> CommandResult {
     CommandResult {
         code: 0,
         stdout: String::new(),
@@ -507,6 +569,7 @@ fn append_default_audit_event(
 fn audit_event_from_preflight(
     preflight: &ExecutionPreflight,
     grants: &[GrantPolicy],
+    credentials: &[IssuedGrantCredential],
     context: AuditContext,
     heim_version: &str,
 ) -> heim_audit::AuditEvent {
@@ -520,7 +583,7 @@ fn audit_event_from_preflight(
         heim_version,
         decision,
     )
-    .with_grants(audit_grants_from_preflight(preflight, grants));
+    .with_grants(audit_grants_from_preflight(preflight, grants, credentials));
 
     if let Some(git) = &preflight.request.git {
         event = event.with_git(heim_audit::AuditGitContext::new(
@@ -557,6 +620,7 @@ fn audit_decision_from_preflight(preflight: &ExecutionPreflight) -> heim_audit::
 fn audit_grants_from_preflight(
     preflight: &ExecutionPreflight,
     grants: &[GrantPolicy],
+    credentials: &[IssuedGrantCredential],
 ) -> Vec<heim_audit::AuditGrant> {
     preflight
         .decisions
@@ -572,14 +636,29 @@ fn audit_grants_from_preflight(
                 .map(|grant| matches!(grant.approval.mode, ApprovalMode::Jit { .. }))
                 .unwrap_or(false);
 
-            heim_audit::AuditGrant::new(&decision.grant, provider, approval_required)
+            let mut audit_grant =
+                heim_audit::AuditGrant::new(&decision.grant, provider, approval_required);
+            if let Some(credential) = credentials
+                .iter()
+                .find(|credential| credential.grant == decision.grant)
+            {
+                let metadata = credential.credential.metadata();
+                audit_grant.credential = Some(
+                    heim_audit::AuditCredentialMetadata::new(metadata.kind)
+                        .with_env_vars(metadata.env_vars)
+                        .with_temp_files(metadata.temp_files),
+                );
+            }
+
+            audit_grant
         })
         .collect()
 }
 
 fn run_exec_preflight(
     preflight: ExecutionPreflight,
-    execute_command: impl FnOnce(&[String]) -> CommandResult,
+    credentials: Vec<IssuedGrantCredential>,
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult {
     if let Some(denial) = preflight.first_denial() {
         let Some(reason) = denial.deny_reason() else {
@@ -605,7 +684,12 @@ fn run_exec_preflight(
     let approval_transports = preflight.approval_transports();
 
     if approval_transports.is_empty() {
-        execute_command(&preflight.request.command)
+        let env_vars = credentials
+            .iter()
+            .flat_map(|credential| credential.credential.env_vars())
+            .cloned()
+            .collect::<Vec<_>>();
+        execute_command(&preflight.request.command, &env_vars)
     } else {
         CommandResult {
             code: NOT_IMPLEMENTED_EXIT_CODE,
@@ -623,7 +707,7 @@ fn run_exec_preflight(
     }
 }
 
-fn execute_command(command: &[String]) -> CommandResult {
+fn execute_command(command: &[String], env_vars: &[CredentialEnvVar]) -> CommandResult {
     let Some((program, args)) = command.split_first() else {
         return CommandResult {
             code: 1,
@@ -634,6 +718,7 @@ fn execute_command(command: &[String]) -> CommandResult {
 
     let status = match std::process::Command::new(program)
         .args(args)
+        .envs(env_vars.iter().map(|env| (env.name(), env.value())))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -653,6 +738,151 @@ fn execute_command(command: &[String]) -> CommandResult {
         code: status.code().unwrap_or(1),
         stdout: String::new(),
         stderr: String::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssuedGrantCredential {
+    grant: String,
+    credential: IssuedCredential,
+}
+
+fn issue_credentials_for_preflight(
+    preflight: &ExecutionPreflight,
+    grants: &[GrantPolicy],
+    config_source: ConfigSource,
+) -> Result<Vec<IssuedGrantCredential>, ExecCredentialError> {
+    let config = load_config_source(&config_source).map_err(ExecCredentialError::LoadConfig)?;
+    let mut credentials = Vec::new();
+
+    for decision in &preflight.decisions {
+        let grant = grants
+            .iter()
+            .find(|candidate| candidate.name.as_str() == decision.grant)
+            .ok_or_else(|| ExecCredentialError::MissingGrant {
+                grant: decision.grant.clone(),
+            })?;
+        let provider = config.provider(grant.provider.as_str()).ok_or_else(|| {
+            ExecCredentialError::MissingProviderConfig {
+                grant: decision.grant.clone(),
+                provider: grant.provider.to_string(),
+            }
+        })?;
+        let request = credential_request_for_grant(preflight, grant);
+        let credential = match provider {
+            heim_config::ProviderConfig::GithubPat(_) => {
+                let source = match &config_source.auth_file {
+                    Some(auth_file) => UnsafeLocalAuthSource::load_file(auth_file),
+                    None => UnsafeLocalAuthSource::load_default(),
+                }
+                .map_err(ExecCredentialError::ResolveSecret)?;
+                let ProviderLocalSecrets::GithubPat { token } =
+                    source
+                        .resolve_provider(provider)
+                        .map_err(ExecCredentialError::ResolveSecret)?
+                else {
+                    return Err(ExecCredentialError::ProviderSecretMismatch {
+                        provider: grant.provider.to_string(),
+                    });
+                };
+                GithubPatProvider::from_secret(token)
+                    .map_err(ExecCredentialError::IssueCredential)?
+                    .issue(&request)
+                    .map_err(ExecCredentialError::IssueCredential)?
+            }
+            heim_config::ProviderConfig::AwsSts(_) => {
+                return Err(ExecCredentialError::IssueCredential(
+                    heim_providers::ProviderError::UnsupportedProvider {
+                        provider: grant.provider.to_string(),
+                        provider_type: "aws_sts",
+                    },
+                ));
+            }
+            heim_config::ProviderConfig::GithubApp(_) => {
+                return Err(ExecCredentialError::IssueCredential(
+                    heim_providers::ProviderError::UnsupportedProvider {
+                        provider: grant.provider.to_string(),
+                        provider_type: "github_app",
+                    },
+                ));
+            }
+        };
+
+        credentials.push(IssuedGrantCredential {
+            grant: decision.grant.clone(),
+            credential,
+        });
+    }
+
+    Ok(credentials)
+}
+
+fn credential_request_for_grant(
+    preflight: &ExecutionPreflight,
+    grant: &GrantPolicy,
+) -> CredentialRequest {
+    let mut request = CredentialRequest::new(
+        grant.name.to_string(),
+        grant.provider.to_string(),
+        preflight.request.requester.clone(),
+        preflight.request.command.clone(),
+        preflight.request.cwd.clone(),
+    );
+
+    if let Some(git) = &preflight.request.git {
+        request = request.with_git(ProviderGitContext::new(
+            git.remote.clone(),
+            git.branch.clone(),
+        ));
+    }
+
+    request
+}
+
+#[derive(Debug)]
+enum ExecCredentialError {
+    LoadConfig(heim_config::ConfigError),
+    ResolveSecret(heim_sources::SecretSourceError),
+    IssueCredential(heim_providers::ProviderError),
+    MissingGrant { grant: String },
+    MissingProviderConfig { grant: String, provider: String },
+    ProviderSecretMismatch { provider: String },
+}
+
+impl fmt::Display for ExecCredentialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoadConfig(source) => write!(formatter, "{source}"),
+            Self::ResolveSecret(source) => write!(formatter, "{source}"),
+            Self::IssueCredential(source) => write!(formatter, "{source}"),
+            Self::MissingGrant { grant } => {
+                write!(
+                    formatter,
+                    "policy decision referenced missing grant {grant}"
+                )
+            }
+            Self::MissingProviderConfig { grant, provider } => write!(
+                formatter,
+                "grant {grant} references provider {provider}, but it is not configured"
+            ),
+            Self::ProviderSecretMismatch { provider } => write!(
+                formatter,
+                "provider {provider} resolved an unexpected local secret set"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExecCredentialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LoadConfig(source) => Some(source),
+            Self::ResolveSecret(source) => Some(source),
+            Self::IssueCredential(source) => Some(source),
+            Self::MissingGrant { .. }
+            | Self::MissingProviderConfig { .. }
+            | Self::ProviderSecretMismatch { .. } => None,
+        }
     }
 }
 
@@ -938,12 +1168,18 @@ approval = "grant"
     #[test]
     fn exec_preflight_allows_grant_policy() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let auth = TestFile::unsafe_auth_file();
         let result = run_from_requester(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
                 "github.personal-readonly",
                 "--",
                 "gh",
@@ -962,14 +1198,22 @@ approval = "grant"
     #[test]
     fn exec_runs_allowed_command_and_propagates_exit_code() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let auth = TestFile::unsafe_auth_file();
         let command_seen = Rc::new(RefCell::new(Vec::new()));
         let command_sink = Rc::clone(&command_seen);
+        let env_seen = Rc::new(RefCell::new(Vec::new()));
+        let env_sink = Rc::clone(&env_seen);
         let result = run_from_with_context(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
                 "github.personal-readonly",
                 "--",
                 "gh",
@@ -980,8 +1224,12 @@ approval = "grant"
             || Ok("gh".to_owned()),
             super::test_audit_context,
             |_| Ok(()),
-            |command| {
+            |command, env_vars| {
                 *command_sink.borrow_mut() = command.to_vec();
+                *env_sink.borrow_mut() = env_vars
+                    .iter()
+                    .map(|env| (env.name().to_owned(), env.value().to_owned()))
+                    .collect();
                 super::CommandResult {
                     code: 17,
                     stdout: "child stdout\n".to_owned(),
@@ -994,6 +1242,13 @@ approval = "grant"
         assert_eq!(result.stdout, "child stdout\n");
         assert_eq!(result.stderr, "child stderr\n");
         assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+        assert_eq!(
+            env_seen.borrow().as_slice(),
+            [
+                ("GH_TOKEN".to_owned(), "ghp_secret".to_owned()),
+                ("GITHUB_TOKEN".to_owned(), "ghp_secret".to_owned())
+            ]
+        );
     }
 
     #[test]
@@ -1087,12 +1342,18 @@ approval = "grant"
     #[test]
     fn exec_emits_allow_audit_event() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let auth = TestFile::unsafe_auth_file();
         let (result, event) = run_from_requester_with_audit(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
                 "github.personal-readonly",
                 "--",
                 "gh",
@@ -1112,6 +1373,11 @@ approval = "grant"
         assert_eq!(event.grants[0].name, "github.personal-readonly");
         assert_eq!(event.grants[0].provider, "github_personal");
         assert!(!event.grants[0].approval_required);
+        let credential = event.grants[0].credential.as_ref().expect("credential");
+        assert_eq!(credential.kind, "github_pat");
+        assert_eq!(credential.env_vars, ["GH_TOKEN", "GITHUB_TOKEN"]);
+        assert_eq!(credential.temp_files, Vec::<String>::new());
+        assert!(!format!("{event:?}").contains("ghp_secret"));
         assert_eq!(event.heim_version, env!("CARGO_PKG_VERSION"));
     }
 
@@ -1178,12 +1444,18 @@ approval = "grant"
     #[test]
     fn exec_fails_when_audit_event_write_fails() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let auth = TestFile::unsafe_auth_file();
         let result = run_from_with_context(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
                 "github.personal-readonly",
                 "--",
                 "gh",
@@ -1197,12 +1469,55 @@ approval = "grant"
                 let sink = heim_audit::JsonlAuditSink::new("/dev/null/audit.jsonl");
                 sink.append(&sample_audit_event())
             },
-            |_| panic!("command should not execute when audit write fails"),
+            |_, _| panic!("command should not execute when audit write fails"),
         );
 
         assert_eq!(result.code, 4);
         assert!(result.stdout.is_empty());
         assert!(result.stderr.contains("failed to write exec audit event"));
+    }
+
+    #[test]
+    fn exec_fails_closed_for_allowed_provider_without_issuer() {
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws_prod"
+allow = ["codex"]
+commands = ["aws *"]
+approval = "grant"
+"#,
+        );
+        let result = run_from_with_context(
+            [
+                "heim",
+                "exec",
+                "--file",
+                policy.path().to_str().expect("utf-8 path"),
+                "--config-file",
+                &config,
+                "aws.prod-readonly",
+                "--",
+                "aws",
+                "sts",
+                "get-caller-identity",
+            ],
+            || Ok("codex".to_owned()),
+            super::test_audit_context,
+            |_| Ok(()),
+            |_, _| panic!("command should not execute when provider cannot issue credentials"),
+        );
+
+        assert_eq!(result.code, 5);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("provider aws_prod has type aws_sts, which cannot issue credentials yet")
+        );
     }
 
     #[test]
@@ -1481,10 +1796,35 @@ approval = "grant"
             Self { path }
         }
 
+        fn unsafe_auth_file() -> Self {
+            let file = Self::new(
+                "auth",
+                r#"{
+                    "github_personal_pat": {
+                        "type": "github_pat",
+                        "token": "ghp_secret"
+                    }
+                }"#,
+            );
+            set_owner_only_permissions(file.path());
+            file
+        }
+
         fn path(&self) -> &Path {
             &self.path
         }
     }
+
+    #[cfg(unix)]
+    fn set_owner_only_permissions(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions).expect("set owner-only permissions");
+    }
+
+    #[cfg(not(unix))]
+    fn set_owner_only_permissions(_: &Path) {}
 
     impl Drop for TestFile {
         fn drop(&mut self) {

@@ -12,18 +12,24 @@ fn exec_binary_runs_allowed_command() {
         r#"
 [[grants]]
 name = "test.run"
-provider = "test.provider"
+provider = "github_personal"
 allow = ["*"]
 commands = ["rustc *"]
 approval = "grant"
 "#,
     );
+    let config = temp.write_config();
+    let auth = temp.write_auth();
 
     let output = heim_command(temp.path())
         .args([
             "exec",
             "--file",
             policy.to_str().expect("policy path"),
+            "--config-file",
+            config.to_str().expect("config path"),
+            "--auth-file",
+            auth.to_str().expect("auth path"),
             "test.run",
             "--",
             "rustc",
@@ -44,18 +50,24 @@ fn exec_binary_reports_spawn_failure() {
         r#"
 [[grants]]
 name = "test.missing"
-provider = "test.provider"
+provider = "github_personal"
 allow = ["*"]
 commands = ["heim-missing-command-for-test"]
 approval = "grant"
 "#,
     );
+    let config = temp.write_config();
+    let auth = temp.write_auth();
 
     let output = heim_command(temp.path())
         .args([
             "exec",
             "--file",
             policy.to_str().expect("policy path"),
+            "--config-file",
+            config.to_str().expect("config path"),
+            "--auth-file",
+            auth.to_str().expect("auth path"),
             "test.missing",
             "--",
             "heim-missing-command-for-test",
@@ -111,7 +123,48 @@ impl TempDir {
         fs::write(&path, contents).expect("policy file");
         path
     }
+
+    fn write_config(&self) -> PathBuf {
+        let path = self.path.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.github_personal]
+type = "github_pat"
+token = { auth = "github_personal_pat" }
+"#,
+        )
+        .expect("config file");
+        path
+    }
+
+    fn write_auth(&self) -> PathBuf {
+        let path = self.path.join(".auth.json");
+        fs::write(
+            &path,
+            r#"{
+  "github_personal_pat": {
+    "type": "github_pat",
+    "token": "ghp_secret"
+  }
+}"#,
+        )
+        .expect("auth file");
+        set_owner_only_permissions(&path);
+        path
+    }
 }
+
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, permissions).expect("auth file permissions");
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_: &Path) {}
 
 impl Drop for TempDir {
     fn drop(&mut self) {

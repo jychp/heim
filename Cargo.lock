@@ -145,6 +145,8 @@ dependencies = [
  "heim-core",
  "heim-exec",
  "heim-policy",
+ "heim-providers",
+ "heim-sources",
  "sysinfo",
 ]
 
@@ -180,6 +182,9 @@ dependencies = [
 [[package]]
 name = "heim-providers"
 version = "0.1.0"
+dependencies = [
+ "heim-sources",
+]
 
 [[package]]
 name = "heim-sources"

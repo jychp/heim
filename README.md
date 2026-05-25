@@ -45,9 +45,10 @@ heim approvals
 ```
 
 Only `doctor`, `config validate`, `policy validate`, `policy check`, `exec`
-policy preflight and allowed command execution, `--help`, and `--version` are
-implemented today. The other commands are parsed and return an explicit "not
-implemented yet" error until their behavior is accepted.
+policy preflight, GitHub PAT environment injection for allowed `exec` requests,
+allowed command execution, `--help`, and `--version` are implemented today.
+The other commands are parsed and return an explicit "not implemented yet"
+error until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -83,15 +84,16 @@ Provider configuration is loaded from the platform config directory:
 - macOS: `~/Library/Application Support/heim/config.toml`
 - Windows: `%APPDATA%\heim\config.toml`
 
-The config schema can model AWS STS, GitHub App, and GitHub PAT providers for
-future credential issuance. Heim validates this schema but does not call
-providers or inject credentials yet.
+The config schema can model AWS STS, GitHub App, and GitHub PAT providers.
+Heim validates this schema and can issue a configured GitHub PAT into an
+allowed child process. AWS STS and GitHub App credential issuance are not
+implemented yet.
 
 Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
 supported but should be avoided for sensitive use when better sources are
 available. On Unix, Heim requires owner-only permissions for this file.
 The `heim-sources` crate can resolve these local auth references into typed
-secret material for future providers, with redacted debug output.
+secret material for providers, with redacted debug output.
 
 The default config file can be validated:
 
@@ -131,14 +133,22 @@ heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-iden
 ```bash
 heim exec aws.prod-readonly -- aws sts get-caller-identity
 heim exec --file examples/policy.toml github.personal-readonly -- gh pr view 42
+heim exec --file examples/policy.toml --config-file examples/config.toml --auth-file ~/.config/heim/.auth.json github.personal-readonly -- gh pr view 42
 ```
 
 For `heim exec`, the requester is inferred from the parent process that invoked
 the `heim` binary. Policy evaluation returns `allow`, `deny`, or
 `require_approval`. When every requested grant is allowed directly by policy,
-Heim runs the wrapped command without adding credentials and returns the
-command exit code. It does not contact providers, request approvals, or issue
-credentials yet.
+Heim loads provider configuration and issues supported local credentials before
+starting the wrapped command. The current issuer supports `github_pat` only and
+injects `GH_TOKEN` and `GITHUB_TOKEN` into the child process. AWS STS and
+GitHub App providers fail closed until their provider implementations are
+added. Heim does not contact AWS or GitHub, request approvals, or mint GitHub
+App tokens yet.
+
+Injected variables are scoped to the child process. If `GH_TOKEN` or
+`GITHUB_TOKEN` already exist in the parent environment, Heim's issued values
+override them for the wrapped command only.
 
 The `heim-exec` crate builds the local execution context used by this preflight:
 requested grants, inferred requester, wrapped command, current working
@@ -162,8 +172,9 @@ By default, audit writes target the platform config directory:
 - Windows: `%APPDATA%\heim\logs\audit.jsonl`
 
 Audit records must never contain credential secret values. `heim exec` emits one
-local audit event for the policy preflight decision. It does not contact
-providers, request approvals, or issue credentials yet.
+local audit event for the policy preflight decision and records redacted
+credential carrier metadata for issued GitHub PAT grants. It does not contact
+AWS or GitHub, request approvals, or mint GitHub App tokens yet.
 `heim audit` does not read audit events yet.
 
 See `docs/policy.md`, `docs/config.md`, `examples/policy.toml`, and

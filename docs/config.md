@@ -2,8 +2,9 @@
 
 Heim configuration describes provider metadata and optional unsafe local auth
 entries. The current implementation validates config, provider, and unsafe
-local auth file schemas only. It does not call AWS, call GitHub, read secrets
-for issuance, or inject credentials into child processes yet.
+local auth file schemas. It can also resolve a GitHub PAT from unsafe local auth
+and inject it into allowed `heim exec` child processes. It does not call AWS,
+call GitHub, mint GitHub App tokens, or request approvals yet.
 
 ## Config File
 
@@ -57,8 +58,12 @@ Policy provider references can also be checked against a config file:
 heim config validate --file examples/config.toml --policy-file examples/policy.toml
 ```
 
-`heim exec` does not enforce that cross-file check yet because credential
-issuance is intentionally not wired in this PR.
+`heim exec` loads provider configuration when policy allows a command to run.
+For local testing, pass an explicit config file:
+
+```bash
+heim exec --file examples/policy.toml --config-file examples/config.toml github.personal-readonly -- gh pr view 42
+```
 
 ## Providers
 
@@ -150,9 +155,20 @@ It can also resolve the local secrets required by one configured provider:
 GitHub App providers require a private key, GitHub PAT providers require a
 token, and AWS STS providers require no unsafe local auth secret.
 
-This is only a source boundary for future provider implementations. It does not
-call GitHub, mint tokens, inject environment variables, or wire secrets into
-`heim exec` yet.
+`heim exec` now uses this source boundary for `github_pat` providers when a
+grant is allowed directly by policy. The GitHub PAT provider injects:
+
+```text
+GH_TOKEN
+GITHUB_TOKEN
+```
+
+These variables are scoped to the child process. If either variable already
+exists in the parent environment, Heim's issued value overrides it for the
+wrapped command only.
+
+GitHub App and AWS STS providers are configured and validated, but they cannot
+issue credentials yet.
 
 Resolved secrets redact their values in `Debug` output. Error messages include
 auth entry names and secret types only, never secret values.
