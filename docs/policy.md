@@ -193,10 +193,11 @@ are added.
 Injected variables override same-named parent environment variables for the
 wrapped command only.
 
-When any requested grant requires approval, Heim still stops after preflight and
-returns an explicit not-implemented exit code because approval transport calls
-are intentionally not implemented yet. Denied requests return the policy denial
-exit code and do not start the wrapped command.
+When any requested grant requires approval, Heim loads config, validates the
+referenced approval transport, builds one approval request per transport, and
+then returns an explicit not-implemented exit code because approval transport
+calls are intentionally not implemented yet. Denied requests return the policy
+denial exit code and do not start the wrapped command.
 
 During preflight, Heim also builds a local execution context:
 
@@ -206,8 +207,8 @@ During preflight, Heim also builds a local execution context:
 - current working directory
 - Git remote and branch when the command is run inside a Git repository
 
-This context is intended to feed future approval messages, provider requests,
-and audit events. Heim does not send it to Slack, contact AWS or GitHub, or mint
-GitHub App installation tokens yet. Git metadata detection is best-effort; Heim
-continues without it when `git` is unavailable or the current directory is not a
-Git repository.
+This context feeds current audit events and prepared approval requests, and is
+intended to feed future provider requests. Heim does not send it to Slack,
+contact AWS or GitHub, or mint GitHub App installation tokens yet. Git metadata
+detection is best-effort; Heim continues without it when `git` is unavailable
+or the current directory is not a Git repository.

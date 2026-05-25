@@ -3,9 +3,10 @@
 Heim configuration describes provider metadata, approval transports, and
 optional unsafe local auth entries. The current implementation validates
 config, provider, approval transport, and unsafe local auth file schemas. It
-can also resolve a GitHub PAT from unsafe local auth and inject it into allowed
-`heim exec` child processes. It does not call AWS, call GitHub, mint GitHub App
-tokens, or request approvals yet.
+can also prepare JIT approval requests from configured transports, resolve a
+GitHub PAT from unsafe local auth, and inject it into allowed `heim exec` child
+processes. It does not call AWS, call GitHub, mint GitHub App tokens, call
+Slack, or request approvals yet.
 
 ## Config File
 
@@ -65,8 +66,8 @@ config file:
 heim config validate --file examples/config.toml --policy-file examples/policy.toml
 ```
 
-`heim exec` loads provider configuration when policy allows a command to run.
-For local testing, pass an explicit config file:
+`heim exec` loads config when policy allows a command to run or when policy
+requires JIT approval. For local testing, pass an explicit config file:
 
 ```bash
 heim exec --file examples/policy.toml --config-file examples/config.toml github.personal-readonly -- gh pr view 42

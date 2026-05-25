@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{ffi::OsStr, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use heim_approvals::{ApprovalGitContext, ApprovalGrant, ApprovalRequest};
 use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
@@ -17,6 +18,7 @@ const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
 const POLICY_DENIED_EXIT_CODE: i32 = 3;
 const AUDIT_ERROR_EXIT_CODE: i32 = 4;
 const CREDENTIAL_ERROR_EXIT_CODE: i32 = 5;
+const APPROVAL_ERROR_EXIT_CODE: i32 = 6;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CommandResult {
@@ -317,6 +319,28 @@ where
         };
 
     let preflight = evaluate_preflight(&document.grants, request);
+    let context = audit_context();
+    let approval_requests =
+        if preflight.first_denial().is_none() && !preflight.approval_transports().is_empty() {
+            match approval_requests_for_preflight(
+                &preflight,
+                &document,
+                &cli_request.config_source,
+                &context.request_id,
+            ) {
+                Ok(requests) => requests,
+                Err(error) => {
+                    return CommandResult {
+                        code: APPROVAL_ERROR_EXIT_CODE,
+                        stdout: String::new(),
+                        stderr: format!("failed to prepare approval request: {error}\n"),
+                    };
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
     let credentials =
         if preflight.first_denial().is_none() && preflight.approval_transports().is_empty() {
             match issue_credentials_for_preflight(
@@ -340,7 +364,7 @@ where
         &preflight,
         &document.grants,
         &credentials,
-        audit_context(),
+        context,
         env!("CARGO_PKG_VERSION"),
     );
 
@@ -352,7 +376,7 @@ where
         };
     }
 
-    run_exec_preflight(preflight, credentials, execute_command)
+    run_exec_preflight(preflight, credentials, approval_requests, execute_command)
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -655,6 +679,7 @@ fn audit_grants_from_preflight(
 fn run_exec_preflight(
     preflight: ExecutionPreflight,
     credentials: Vec<IssuedGrantCredential>,
+    _approval_requests: Vec<ApprovalRequest>,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult {
     if let Some(denial) = preflight.first_denial() {
@@ -834,6 +859,127 @@ fn credential_request_for_grant(
     }
 
     request
+}
+
+fn approval_requests_for_preflight(
+    preflight: &ExecutionPreflight,
+    document: &heim_config::PolicyDocument,
+    config_source: &ConfigSource,
+    request_id: &str,
+) -> Result<Vec<ApprovalRequest>, ExecApprovalError> {
+    let config = load_config_source(config_source).map_err(ExecApprovalError::LoadConfig)?;
+    let mut requests = Vec::new();
+
+    for transport_name in preflight.approval_transports() {
+        let transport = config.approval_transport(&transport_name).ok_or_else(|| {
+            ExecApprovalError::MissingApprovalTransport {
+                transport: transport_name.clone(),
+            }
+        })?;
+        let approval_grants = approval_grants_for_transport(
+            &preflight.decisions,
+            &document.grants,
+            &config,
+            transport.name.as_str(),
+        )?;
+        let mut builder = ApprovalRequest::builder(request_id.to_owned(), transport.name.clone())
+            .grants(approval_grants)
+            .requester(preflight.request.requester.clone())
+            .command(preflight.request.command.clone())
+            .cwd(preflight.request.cwd.clone())
+            .options(transport.options.clone());
+
+        if let Some(git) = &preflight.request.git {
+            builder = builder.git(ApprovalGitContext::new(
+                git.remote.clone(),
+                git.branch.clone(),
+            ));
+        }
+
+        requests.push(builder.build().map_err(ExecApprovalError::BuildRequest)?);
+    }
+
+    Ok(requests)
+}
+
+fn approval_grants_for_transport(
+    decisions: &[heim_exec::GrantPreflightDecision],
+    grants: &[GrantPolicy],
+    config: &heim_config::HeimConfig,
+    transport: &str,
+) -> Result<Vec<ApprovalGrant>, ExecApprovalError> {
+    decisions
+        .iter()
+        .filter(|decision| match &decision.decision {
+            PolicyDecision::RequireApproval {
+                transport: decision_transport,
+            } => decision_transport.as_str() == transport,
+            PolicyDecision::Allow | PolicyDecision::Deny { .. } => false,
+        })
+        .map(|decision| {
+            let grant = grants
+                .iter()
+                .find(|candidate| candidate.name.as_str() == decision.grant)
+                .ok_or_else(|| ExecApprovalError::MissingGrant {
+                    grant: decision.grant.clone(),
+                })?;
+            if !config.contains_provider(grant.provider.as_str()) {
+                return Err(ExecApprovalError::MissingProviderConfig {
+                    grant: grant.name.to_string(),
+                    provider: grant.provider.to_string(),
+                });
+            }
+
+            Ok(ApprovalGrant::new(
+                grant.name.to_string(),
+                grant.provider.to_string(),
+            ))
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+enum ExecApprovalError {
+    LoadConfig(heim_config::ConfigError),
+    BuildRequest(heim_approvals::ApprovalRequestBuildError),
+    MissingGrant { grant: String },
+    MissingProviderConfig { grant: String, provider: String },
+    MissingApprovalTransport { transport: String },
+}
+
+impl fmt::Display for ExecApprovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoadConfig(source) => write!(formatter, "{source}"),
+            Self::BuildRequest(source) => write!(formatter, "{source}"),
+            Self::MissingGrant { grant } => {
+                write!(
+                    formatter,
+                    "policy decision referenced missing grant {grant}"
+                )
+            }
+            Self::MissingProviderConfig { grant, provider } => write!(
+                formatter,
+                "grant {grant} references provider {provider}, but it is not configured"
+            ),
+            Self::MissingApprovalTransport { transport } => write!(
+                formatter,
+                "approval transport {transport} is required by policy but is not configured"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExecApprovalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LoadConfig(source) => Some(source),
+            Self::BuildRequest(source) => Some(source),
+            Self::MissingGrant { .. }
+            | Self::MissingProviderConfig { .. }
+            | Self::MissingApprovalTransport { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1141,12 +1287,15 @@ approval = "grant"
     #[test]
     fn exec_parses_grants_and_trailing_command_without_executing() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
         let result = run_from_requester(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
                 "aws.prod-readonly",
                 "--",
                 "aws",
@@ -1285,12 +1434,15 @@ approval = "grant"
     #[test]
     fn exec_preflight_requires_approval_when_any_grant_requires_jit() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
         let result = run_from_requester(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
                 "github.personal-readonly",
                 "github.drymn-pr-write",
                 "--",
@@ -1417,12 +1569,15 @@ approval = "grant"
     #[test]
     fn exec_emits_require_approval_audit_event() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
+        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
         let (result, event) = run_from_requester_with_audit(
             [
                 "heim",
                 "exec",
                 "--file",
                 &file,
+                "--config-file",
+                &config,
                 "aws.prod-readonly",
                 "--",
                 "aws",
@@ -1442,6 +1597,85 @@ approval = "grant"
         assert_eq!(event.grants[0].name, "aws.prod-readonly");
         assert_eq!(event.grants[0].provider, "aws_prod");
         assert!(event.grants[0].approval_required);
+    }
+
+    #[test]
+    fn exec_builds_approval_requests_from_configured_transport_options() {
+        let config = TestFile::new(
+            "config",
+            r##"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+
+[providers.github_drymn]
+type = "github_app"
+app_id = 123456
+installation_id = 987654
+private_key = { auth = "github_drymn_app_private_key" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "60m"]
+"##,
+        );
+        let document = heim_config::parse_policy_str(
+            r#"
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws_prod"
+allow = ["codex"]
+commands = ["claude-code"]
+approval = "jit:slack"
+
+[[grants]]
+name = "github.drymn-pr-write"
+provider = "github_drymn"
+allow = ["codex"]
+commands = ["claude-code"]
+approval = "jit:slack"
+"#,
+        )
+        .expect("policy document");
+        let request = heim_exec::ExecutionRequest::new(
+            vec![
+                "aws.prod-readonly".to_owned(),
+                "github.drymn-pr-write".to_owned(),
+            ],
+            "codex",
+            vec!["claude-code".to_owned()],
+            PathBuf::from("/workspace"),
+        );
+        let preflight = heim_exec::evaluate_preflight(&document.grants, request);
+
+        let requests = super::approval_requests_for_preflight(
+            &preflight,
+            &document,
+            &super::ConfigSource {
+                file: Some(config.path().to_path_buf()),
+                auth_file: None,
+            },
+            "test-request",
+        )
+        .expect("approval requests");
+
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.request_id, "test-request");
+        assert_eq!(request.transport.as_str(), "slack");
+        assert_eq!(request.requester, "codex");
+        assert_eq!(request.command, ["claude-code"]);
+        assert_eq!(request.cwd, PathBuf::from("/workspace"));
+        assert_eq!(request.grants.len(), 2);
+        assert_eq!(request.grants[0].name, "aws.prod-readonly");
+        assert_eq!(request.grants[0].provider, "aws_prod");
+        assert_eq!(request.grants[1].name, "github.drymn-pr-write");
+        assert_eq!(request.grants[1].provider, "github_drymn");
+        assert_eq!(request.options[0].id, "15m");
+        assert_eq!(request.options[0].label, "Approve 15m");
+        assert_eq!(request.options[1].id, "60m");
+        assert_eq!(request.options[1].label, "Approve 60m");
     }
 
     #[test]
