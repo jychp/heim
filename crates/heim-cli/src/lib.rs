@@ -1679,6 +1679,56 @@ approval = "jit:slack"
     }
 
     #[test]
+    fn exec_fails_closed_when_jit_transport_is_not_configured() {
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws_prod"
+allow = ["codex"]
+commands = ["aws *"]
+approval = "jit:slack"
+"#,
+        );
+        let config = TestFile::new(
+            "config",
+            r#"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+"#,
+        );
+        let result = run_from_with_context(
+            [
+                "heim",
+                "exec",
+                "--file",
+                policy.path().to_str().expect("utf-8 path"),
+                "--config-file",
+                config.path().to_str().expect("utf-8 path"),
+                "aws.prod-readonly",
+                "--",
+                "aws",
+                "sts",
+                "get-caller-identity",
+            ],
+            || Ok("codex".to_owned()),
+            super::test_audit_context,
+            |_| Ok(()),
+            |_, _| panic!("command should not execute without approval transport config"),
+        );
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval transport slack is required by policy but is not configured")
+        );
+    }
+
+    #[test]
     fn exec_fails_when_audit_event_write_fails() {
         let file = format!("{}/../../examples/policy.toml", env!("CARGO_MANIFEST_DIR"));
         let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
