@@ -33,5 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with strict Unix file permission checks.
 - Unsafe local auth secret source resolution for GitHub App private keys and
   GitHub PATs, without provider calls or credential injection.
+- GitHub PAT credential issuance for allowed `heim exec` requests, with
+  process-scoped `GH_TOKEN` and `GITHUB_TOKEN` environment injection.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.
