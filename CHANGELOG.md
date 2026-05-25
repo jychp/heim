@@ -29,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   without credential injection yet.
 - Transport-neutral approval request and decision contract for future JIT
   approval providers.
+- Approval options for provider-configured choices such as approving a request
+  for a specific duration.
 - Provider configuration schema for future AWS STS, GitHub App, and GitHub PAT
   credential issuance.
 - Unsafe local auth file schema for GitHub App private keys and GitHub PATs,

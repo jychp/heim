@@ -4,6 +4,7 @@
 //! is one possible transport, but the contract is intentionally not Slack
 //! specific and does not call external approval systems yet.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -19,6 +20,7 @@ pub struct ApprovalRequest {
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub git: Option<ApprovalGitContext>,
+    pub options: Vec<ApprovalOption>,
 }
 
 impl ApprovalRequest {
@@ -37,6 +39,7 @@ impl ApprovalRequest {
             command: command.into_iter().map(Into::into).collect(),
             cwd,
             git: None,
+            options: Vec::new(),
         }
     }
 
@@ -47,6 +50,11 @@ impl ApprovalRequest {
 
     pub fn with_git(mut self, git: ApprovalGitContext) -> Self {
         self.git = Some(git);
+        self
+    }
+
+    pub fn with_options(mut self, options: impl IntoIterator<Item = ApprovalOption>) -> Self {
+        self.options = options.into_iter().collect();
         self
     }
 
@@ -68,6 +76,7 @@ pub struct ApprovalRequestBuilder {
     command: Vec<String>,
     cwd: Option<PathBuf>,
     git: Option<ApprovalGitContext>,
+    options: Vec<ApprovalOption>,
 }
 
 impl ApprovalRequestBuilder {
@@ -80,6 +89,7 @@ impl ApprovalRequestBuilder {
             command: Vec::new(),
             cwd: None,
             git: None,
+            options: Vec::new(),
         }
     }
 
@@ -108,6 +118,11 @@ impl ApprovalRequestBuilder {
         self
     }
 
+    pub fn options(mut self, options: impl IntoIterator<Item = ApprovalOption>) -> Self {
+        self.options = options.into_iter().collect();
+        self
+    }
+
     pub fn build(self) -> Result<ApprovalRequest, ApprovalRequestBuildError> {
         if self.request_id.is_empty() {
             return Err(ApprovalRequestBuildError::MissingRequestId);
@@ -127,6 +142,7 @@ impl ApprovalRequestBuilder {
         }
 
         let cwd = self.cwd.ok_or(ApprovalRequestBuildError::MissingCwd)?;
+        validate_approval_options(&self.options)?;
 
         Ok(ApprovalRequest {
             request_id: self.request_id,
@@ -136,8 +152,34 @@ impl ApprovalRequestBuilder {
             command: self.command,
             cwd,
             git: self.git,
+            options: self.options,
         })
     }
+}
+
+fn validate_approval_options(options: &[ApprovalOption]) -> Result<(), ApprovalRequestBuildError> {
+    let mut ids = BTreeSet::new();
+    for option in options {
+        if option.id.is_empty() {
+            return Err(ApprovalRequestBuildError::InvalidOption {
+                message: "approval option id is required".to_owned(),
+            });
+        }
+
+        if option.label.is_empty() {
+            return Err(ApprovalRequestBuildError::InvalidOption {
+                message: format!("approval option {} must include a label", option.id),
+            });
+        }
+
+        if !ids.insert(option.id.as_str()) {
+            return Err(ApprovalRequestBuildError::InvalidOption {
+                message: format!("approval option {} is duplicated", option.id),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Error returned when building an approval request.
@@ -148,6 +190,7 @@ pub enum ApprovalRequestBuildError {
     MissingRequester,
     MissingCommand,
     MissingCwd,
+    InvalidOption { message: String },
 }
 
 impl fmt::Display for ApprovalRequestBuildError {
@@ -158,6 +201,7 @@ impl fmt::Display for ApprovalRequestBuildError {
             Self::MissingRequester => formatter.write_str("approval requester is required"),
             Self::MissingCommand => formatter.write_str("approval command is required"),
             Self::MissingCwd => formatter.write_str("approval current directory is required"),
+            Self::InvalidOption { message } => formatter.write_str(message),
         }
     }
 }
@@ -193,17 +237,37 @@ impl ApprovalGitContext {
     }
 }
 
+/// Provider-configured approval option, such as a duration button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalOption {
+    pub id: String,
+    pub label: String,
+}
+
+impl ApprovalOption {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
 /// Transport-neutral approval outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Approved(ApprovalGrantDecision),
+    ApprovedWithOption {
+        decision: ApprovalGrantDecision,
+        option: ApprovalOption,
+    },
     Denied(ApprovalGrantDecision),
     TimedOut,
 }
 
 impl ApprovalDecision {
     pub fn is_approved(&self) -> bool {
-        matches!(self, Self::Approved(_))
+        matches!(self, Self::Approved(_) | Self::ApprovedWithOption { .. })
     }
 
     pub fn is_denied(&self) -> bool {
@@ -276,7 +340,7 @@ mod tests {
 
     use super::{
         ApprovalDecision, ApprovalError, ApprovalGitContext, ApprovalGrant, ApprovalGrantDecision,
-        ApprovalProvider, ApprovalRequest, ApprovalTransportName,
+        ApprovalOption, ApprovalProvider, ApprovalRequest, ApprovalTransportName,
     };
 
     #[test]
@@ -300,6 +364,7 @@ mod tests {
         assert_eq!(request.requester, "codex");
         assert_eq!(request.command, ["aws", "s3", "ls"]);
         assert_eq!(request.cwd, PathBuf::from("/workspace"));
+        assert!(request.options.is_empty());
         assert_eq!(request.grants[0].name, "aws.prod-readonly");
         assert_eq!(request.grants[0].provider, "aws_prod");
         assert_eq!(
@@ -323,6 +388,10 @@ mod tests {
                 Some("git@github.com:jychp/heim.git".to_owned()),
                 Some("feature/test".to_owned()),
             ))
+            .options([
+                ApprovalOption::new("15m", "Approve 15m"),
+                ApprovalOption::new("60m", "Approve 60m"),
+            ])
             .build()
             .expect("approval request");
 
@@ -334,6 +403,8 @@ mod tests {
         assert_eq!(request.requester, "codex");
         assert_eq!(request.command, ["claude-code"]);
         assert_eq!(request.cwd, PathBuf::from("/workspace"));
+        assert_eq!(request.options[0].id, "15m");
+        assert_eq!(request.options[1].label, "Approve 60m");
         assert_eq!(
             request.git.expect("git context").branch.as_deref(),
             Some("feature/test")
@@ -356,13 +427,38 @@ mod tests {
     }
 
     #[test]
+    fn approval_request_builder_rejects_duplicate_option_ids() {
+        let error = ApprovalRequest::builder(
+            "request-1",
+            ApprovalTransportName::new("slack").expect("valid transport"),
+        )
+        .grants([ApprovalGrant::new("aws.prod-readonly", "aws_prod")])
+        .requester("codex")
+        .command(["aws", "s3", "ls"])
+        .cwd("/workspace")
+        .options([
+            ApprovalOption::new("15m", "Approve 15m"),
+            ApprovalOption::new("15m", "Approve 15 minutes"),
+        ])
+        .build()
+        .expect_err("duplicate option id");
+
+        assert_eq!(error.to_string(), "approval option 15m is duplicated");
+    }
+
+    #[test]
     fn approval_decision_reports_outcome() {
         let approved =
             ApprovalDecision::Approved(ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"));
+        let approved_with_option = ApprovalDecision::ApprovedWithOption {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            option: ApprovalOption::new("15m", "Approve 15m"),
+        };
         let denied =
             ApprovalDecision::Denied(ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"));
 
         assert!(approved.is_approved());
+        assert!(approved_with_option.is_approved());
         assert!(!approved.is_denied());
         assert!(denied.is_denied());
         assert!(!denied.is_approved());

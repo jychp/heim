@@ -18,6 +18,7 @@ An approval request contains the context a human approver needs:
 - wrapped command and arguments
 - current working directory
 - Git remote and branch when detected
+- provider-configured approval options when available
 
 This mirrors the local context already collected by `heim exec` for preflight,
 audit, and future provider requests.
@@ -27,11 +28,24 @@ this context. The builder validates that a request has at least one grant, a
 request id, requester, command, and current working directory before it can be
 sent to a transport.
 
+Approval options are configured by the approval provider or transport
+integration. The common model keeps them generic:
+
+```text
+id = "15m"
+label = "Approve 15m"
+```
+
+Duration buttons such as `15m` or `60m` are the expected v0 Slack use case, but
+the contract does not require options to be durations.
+
 ## Decision
 
 An approval provider returns a transport-neutral decision:
 
 - `approved` with approver and decision timestamp metadata
+- `approved_with_option` with approver, decision timestamp metadata, and the
+  selected option
 - `denied` with approver and decision timestamp metadata
 - `timed_out`
 
