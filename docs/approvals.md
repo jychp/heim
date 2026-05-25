@@ -4,8 +4,9 @@ Heim approvals are modeled as transport-neutral requests and decisions. A
 transport can be Slack, a future CLI prompt, a ticketing system, or another
 approval backend.
 
-The current implementation defines the contract in `heim-approvals`. It does
-not call Slack or any external approval system yet.
+The current implementation defines the contract in `heim-approvals`. `heim
+exec` can prepare approval requests from a JIT policy decision and configured
+transport options. It does not call Slack or any external approval system yet.
 
 ## Request
 
@@ -89,6 +90,7 @@ encode Slack-only fields in the common request or decision types.
 
 ## Current Limitations
 
-`heim exec` still stops after policy preflight when a grant requires JIT
-approval. Runtime approval dispatch, Slack API calls, approval timeouts, and
+`heim exec` still fails closed when a grant requires JIT approval. It builds
+the transport-neutral approval request first, so runtime approval dispatch can
+use the same request shape later. Slack API calls, approval timeouts, and
 post-approval credential issuance are intentionally deferred.

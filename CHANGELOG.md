@@ -29,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   without credential injection yet.
 - Transport-neutral approval request and decision contract for future JIT
   approval providers.
+- `heim exec` approval request preparation for JIT policy decisions, including
+  configured transport options, while approval dispatch remains deferred.
 - Approval options for provider-configured choices such as approving a request
   for a specific duration.
 - Policy loading for approval transport options using compact TOML arrays.

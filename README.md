@@ -45,10 +45,10 @@ heim approvals
 ```
 
 Only `doctor`, `config validate`, `policy validate`, `policy check`, `exec`
-policy preflight, GitHub PAT environment injection for allowed `exec` requests,
-allowed command execution, `--help`, and `--version` are implemented today.
-The other commands are parsed and return an explicit "not implemented yet"
-error until their behavior is accepted.
+policy preflight, approval request preparation, GitHub PAT environment
+injection for allowed `exec` requests, allowed command execution, `--help`, and
+`--version` are implemented today. The other commands are parsed and return an
+explicit "not implemented yet" error until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -65,7 +65,8 @@ Grant policies can express:
   configured transport such as `slack`
 
 Policy evaluation can drive local preflight and allowed command execution.
-Heim does not request approval yet when JIT approval is required.
+When JIT approval is required, Heim prepares transport-neutral approval
+requests from the execution context and config, but does not send them yet.
 
 Policy files are loaded from the platform config directory by default:
 
@@ -143,8 +144,10 @@ Heim loads provider configuration and issues supported local credentials before
 starting the wrapped command. The current issuer supports `github_pat` only and
 injects `GH_TOKEN` and `GITHUB_TOKEN` into the child process. AWS STS and
 GitHub App providers fail closed until their provider implementations are
-added. Heim does not contact AWS or GitHub, request approvals, or mint GitHub
-App tokens yet.
+added. When approval is required, Heim loads config, validates the referenced
+approval transports, builds approval requests with configured options, and
+fails closed before contacting any transport. Heim does not contact AWS,
+GitHub, or Slack, request approvals, or mint GitHub App tokens yet.
 
 Injected variables are scoped to the child process. If `GH_TOKEN` or
 `GITHUB_TOKEN` already exist in the parent environment, Heim's issued values
