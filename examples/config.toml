@@ -20,3 +20,8 @@ repositories = ["drymn/backend"]
 [providers.github_personal]
 type = "github_pat"
 token = { auth = "github_personal_pat" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "60m"]

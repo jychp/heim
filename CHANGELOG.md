@@ -31,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   approval providers.
 - Approval options for provider-configured choices such as approving a request
   for a specific duration.
+- Policy loading for approval transport options using compact TOML arrays.
 - Provider configuration schema for future AWS STS, GitHub App, and GitHub PAT
   credential issuance.
 - Unsafe local auth file schema for GitHub App private keys and GitHub PATs,

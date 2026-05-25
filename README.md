@@ -84,10 +84,10 @@ Provider configuration is loaded from the platform config directory:
 - macOS: `~/Library/Application Support/heim/config.toml`
 - Windows: `%APPDATA%\heim\config.toml`
 
-The config schema can model AWS STS, GitHub App, and GitHub PAT providers.
-Heim validates this schema and can issue a configured GitHub PAT into an
-allowed child process. AWS STS and GitHub App credential issuance are not
-implemented yet.
+The config schema can model AWS STS, GitHub App, GitHub PAT providers, and
+approval transports such as Slack. Heim validates this schema and can issue a
+configured GitHub PAT into an allowed child process. AWS STS, GitHub App
+credential issuance, and runtime approval dispatch are not implemented yet.
 
 Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
 supported but should be avoided for sensitive use when better sources are

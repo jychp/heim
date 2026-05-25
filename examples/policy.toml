@@ -23,7 +23,3 @@ provider = "github_personal"
 allow = ["gh"]
 commands = ["gh repo view *", "gh pr view *"]
 approval = "grant"
-
-[approval_transports.slack]
-type = "slack"
-channel = "#heim-approvals"
