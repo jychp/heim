@@ -120,7 +120,7 @@ enum PolicyCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// Validate Heim provider configuration.
+    /// Validate Heim configuration.
     Validate {
         /// Config file to validate instead of the default config file.
         #[arg(long)]
@@ -359,11 +359,7 @@ fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
     match command {
         Some(PolicyCommand::Validate { file, dir }) => {
             match load_policy_source(PolicySource { file, dir }) {
-                Ok(document) => ok(format!(
-                    "policy: ok ({} grant(s), {} approval transport(s))\n",
-                    document.grants.len(),
-                    document.approval_transports.len()
-                )),
+                Ok(document) => ok(format!("policy: ok ({} grant(s))\n", document.grants.len())),
                 Err(error) => CommandResult {
                     code: 2,
                     stdout: String::new(),
@@ -447,8 +443,9 @@ fn run_config(command: Option<ConfigCommand>) -> CommandResult {
             }
 
             ok(format!(
-                "config: ok ({} provider(s))\n",
-                config.providers.len()
+                "config: ok ({} provider(s), {} approval transport(s))\n",
+                config.providers.len(),
+                config.approval_transports.len()
             ))
         }
         None => not_implemented("heim config is not implemented yet\n"),
@@ -1052,7 +1049,10 @@ mod tests {
         let result = run_from(["heim", "config", "validate", "--file", &file]);
 
         assert_eq!(result.code, 0);
-        assert_eq!(result.stdout, "config: ok (3 provider(s))\n");
+        assert_eq!(
+            result.stdout,
+            "config: ok (3 provider(s), 1 approval transport(s))\n"
+        );
         assert!(result.stderr.is_empty());
     }
 
@@ -1071,7 +1071,10 @@ mod tests {
         ]);
 
         assert_eq!(result.code, 0);
-        assert_eq!(result.stdout, "config: ok (3 provider(s))\n");
+        assert_eq!(
+            result.stdout,
+            "config: ok (3 provider(s), 1 approval transport(s))\n"
+        );
         assert!(result.stderr.is_empty());
     }
 
@@ -1574,10 +1577,7 @@ approval = "grant"
         let result = run_from(["heim", "policy", "validate", "--file", &file]);
 
         assert_eq!(result.code, 0);
-        assert_eq!(
-            result.stdout,
-            "policy: ok (3 grant(s), 1 approval transport(s))\n"
-        );
+        assert_eq!(result.stdout, "policy: ok (3 grant(s))\n");
         assert!(result.stderr.is_empty());
     }
 
@@ -1587,10 +1587,7 @@ approval = "grant"
         let result = run_from(["heim", "policy", "validate", "--dir", &dir]);
 
         assert_eq!(result.code, 0);
-        assert_eq!(
-            result.stdout,
-            "policy: ok (3 grant(s), 1 approval transport(s))\n"
-        );
+        assert_eq!(result.stdout, "policy: ok (3 grant(s))\n");
         assert!(result.stderr.is_empty());
     }
 

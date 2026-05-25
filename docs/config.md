@@ -1,10 +1,11 @@
 # Configuration
 
-Heim configuration describes provider metadata and optional unsafe local auth
-entries. The current implementation validates config, provider, and unsafe
-local auth file schemas. It can also resolve a GitHub PAT from unsafe local auth
-and inject it into allowed `heim exec` child processes. It does not call AWS,
-call GitHub, mint GitHub App tokens, or request approvals yet.
+Heim configuration describes provider metadata, approval transports, and
+optional unsafe local auth entries. The current implementation validates
+config, provider, approval transport, and unsafe local auth file schemas. It
+can also resolve a GitHub PAT from unsafe local auth and inject it into allowed
+`heim exec` child processes. It does not call AWS, call GitHub, mint GitHub App
+tokens, or request approvals yet.
 
 ## Config File
 
@@ -35,6 +36,11 @@ repositories = ["drymn/backend"]
 [providers.github_personal]
 type = "github_pat"
 token = { auth = "github_personal_pat" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "60m"]
 ```
 
 Provider names may contain ASCII letters, digits, hyphens, and underscores.
@@ -52,7 +58,8 @@ An explicit config file can be validated with:
 heim config validate --file examples/config.toml
 ```
 
-Policy provider references can also be checked against a config file:
+Policy provider and approval transport references can also be checked against a
+config file:
 
 ```bash
 heim config validate --file examples/config.toml --policy-file examples/policy.toml
@@ -64,6 +71,25 @@ For local testing, pass an explicit config file:
 ```bash
 heim exec --file examples/policy.toml --config-file examples/config.toml github.personal-readonly -- gh pr view 42
 ```
+
+## Approval Transports
+
+Approval transports are configured in `config.toml`, not policy files. Policy
+grants reference these transports by name with values such as `approval =
+"jit:slack"`.
+
+`slack` transport config describes a future Slack approval provider.
+
+Required:
+
+- `channel`
+
+Optional:
+
+- `options`
+
+Each option id is mapped to a default approval label. For example, `15m`
+becomes `Approve 15m`.
 
 ## Providers
 

@@ -157,6 +157,7 @@ dependencies = [
 name = "heim-config"
 version = "0.1.0"
 dependencies = [
+ "heim-approvals",
  "heim-core",
  "serde",
  "serde_json",

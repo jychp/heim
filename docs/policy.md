@@ -25,19 +25,16 @@ Heim loads policies from the platform config directory by default:
 The directory may contain one or more `.toml` files. Non-TOML files are
 ignored.
 
-All TOML files are merged before validation. This allows shared approval
-transport configuration to live in one file while grants live in separate
-files.
+All TOML files are merged before validation. Policy files contain grants only.
+Approval transport configuration lives in `config.toml`.
 
 ```text
 $XDG_CONFIG_HOME/heim/policies/
-  approvals.toml
   aws.toml
   github.toml
 ```
 
-Grant names must be unique across the full directory. Approval transport names
-must also be unique across the full directory.
+Grant names must be unique across the full directory.
 
 Files are loaded in sorted path order so diagnostics are stable. Policy meaning
 must not depend on file order because all files are merged before validation.
@@ -124,16 +121,20 @@ transport.
 approval = "jit:slack"
 ```
 
-The transport name references a separate transport configuration.
+The transport name references an approval transport in `config.toml`.
 
 ```toml
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+options = ["15m", "60m"]
 ```
 
-Transport configuration is intentionally separate from grants so Slack can be
-configured once and reused by multiple grants.
+Transport configuration is intentionally separate from grants so Slack secrets
+and transport metadata do not live in policy files.
+
+`options` is optional. When present, each value becomes an approval option
+available to the transport. Heim maps `15m` to a default label of `Approve 15m`.
 
 The approval runtime contract is transport-neutral. Slack is the first planned
 v0 transport, but future transports can implement the same request and decision

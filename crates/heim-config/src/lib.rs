@@ -12,6 +12,7 @@ use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use heim_approvals::ApprovalOption;
 use heim_core::{
     ApprovalPolicy, ApprovalTransportName, CommandRule, GrantName, GrantPolicy, ProviderName,
     RequesterRule,
@@ -22,13 +23,33 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDocument {
     pub grants: Vec<GrantPolicy>,
-    pub approval_transports: Vec<ApprovalTransportName>,
+}
+
+/// One configured approval transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalTransportConfig {
+    pub name: ApprovalTransportName,
+    pub kind: ApprovalTransportKind,
+    pub options: Vec<ApprovalOption>,
+}
+
+impl ApprovalTransportConfig {
+    pub fn name(&self) -> &ApprovalTransportName {
+        &self.name
+    }
+}
+
+/// Supported approval transport backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalTransportKind {
+    Slack { channel: String },
 }
 
 /// Validated Heim configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeimConfig {
     pub providers: Vec<ProviderConfig>,
+    pub approval_transports: Vec<ApprovalTransportConfig>,
 }
 
 impl HeimConfig {
@@ -40,6 +61,16 @@ impl HeimConfig {
 
     pub fn contains_provider(&self, name: &str) -> bool {
         self.provider(name).is_some()
+    }
+
+    pub fn approval_transport(&self, name: &str) -> Option<&ApprovalTransportConfig> {
+        self.approval_transports
+            .iter()
+            .find(|transport| transport.name.as_str() == name)
+    }
+
+    pub fn contains_approval_transport(&self, name: &str) -> bool {
+        self.approval_transport(name).is_some()
     }
 }
 
@@ -367,6 +398,15 @@ pub fn validate_policy_provider_refs(
                 provider: provider.to_owned(),
             });
         }
+
+        if let heim_core::ApprovalMode::Jit { transport } = &grant.approval.mode
+            && !config.contains_approval_transport(transport.as_str())
+        {
+            return Err(ConfigError::UnknownApprovalTransport {
+                grant: grant.name.as_str().to_owned(),
+                transport: transport.to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -439,8 +479,9 @@ pub enum ConfigError {
     DuplicateGrantName {
         grant: String,
     },
-    DuplicateApprovalTransport {
+    InvalidApprovalTransport {
         transport: String,
+        message: String,
     },
     MissingJitTransport {
         grant: String,
@@ -563,10 +604,10 @@ impl fmt::Display for ConfigError {
             Self::DuplicateGrantName { grant } => {
                 write!(formatter, "policy contains duplicate grant {grant}")
             }
-            Self::DuplicateApprovalTransport { transport } => {
+            Self::InvalidApprovalTransport { transport, message } => {
                 write!(
                     formatter,
-                    "policy contains duplicate approval transport {transport}"
+                    "approval transport {transport} is invalid: {message}"
                 )
             }
             Self::MissingJitTransport { grant } => {
@@ -636,6 +677,8 @@ impl std::error::Error for ConfigError {
 struct RawHeimConfig {
     #[serde(default)]
     providers: BTreeMap<String, RawProviderConfig>,
+    #[serde(default)]
+    approval_transports: BTreeMap<String, RawApprovalTransport>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -682,7 +725,16 @@ impl TryFrom<RawHeimConfig> for HeimConfig {
             .map(|(name, provider)| convert_provider_config(name, provider))
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Self { providers })
+        let approval_transports = raw
+            .approval_transports
+            .into_iter()
+            .map(|(name, transport)| convert_approval_transport(name, transport))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            providers,
+            approval_transports,
+        })
     }
 }
 
@@ -890,8 +942,6 @@ fn validate_auth_file_permissions(path: &Path) -> Result<(), ConfigError> {
 struct RawPolicyDocument {
     #[serde(default)]
     grants: Vec<RawGrant>,
-    #[serde(default)]
-    approval_transports: BTreeMap<String, RawApprovalTransport>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -909,6 +959,9 @@ struct RawGrant {
 struct RawApprovalTransport {
     #[serde(rename = "type")]
     transport_type: String,
+    channel: Option<String>,
+    #[serde(default)]
+    options: Vec<String>,
 }
 
 fn has_toml_extension(path: &Path) -> bool {
@@ -972,25 +1025,12 @@ fn merge_raw_policy_documents(
     documents: Vec<RawPolicyDocument>,
 ) -> Result<RawPolicyDocument, ConfigError> {
     let mut grants = Vec::new();
-    let mut approval_transports = BTreeMap::new();
 
     for document in documents {
         grants.extend(document.grants);
-
-        for (name, transport) in document.approval_transports {
-            if approval_transports
-                .insert(name.clone(), transport)
-                .is_some()
-            {
-                return Err(ConfigError::DuplicateApprovalTransport { transport: name });
-            }
-        }
     }
 
-    Ok(RawPolicyDocument {
-        grants,
-        approval_transports,
-    })
+    Ok(RawPolicyDocument { grants })
 }
 
 impl TryFrom<RawPolicyDocument> for PolicyDocument {
@@ -1010,38 +1050,17 @@ impl TryFrom<RawPolicyDocument> for PolicyDocument {
             }
         }
 
-        let approval_transports = raw
-            .approval_transports
-            .into_iter()
-            .map(|(name, transport)| {
-                let _transport_type = transport.transport_type;
-
-                ApprovalTransportName::new(&name).map_err(|error| {
-                    ConfigError::InvalidApprovalTransportName {
-                        name,
-                        message: error.to_string(),
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let grants = raw
             .grants
             .into_iter()
-            .map(|raw_grant| convert_grant(raw_grant, &approval_transports))
+            .map(convert_grant)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Self {
-            grants,
-            approval_transports,
-        })
+        Ok(Self { grants })
     }
 }
 
-fn convert_grant(
-    raw_grant: RawGrant,
-    approval_transports: &[ApprovalTransportName],
-) -> Result<GrantPolicy, ConfigError> {
+fn convert_grant(raw_grant: RawGrant) -> Result<GrantPolicy, ConfigError> {
     let raw_name = raw_grant.name;
     let name = GrantName::new(&raw_name).map_err(|error| ConfigError::InvalidGrantName {
         name: raw_name.clone(),
@@ -1088,7 +1107,7 @@ fn convert_grant(
         })
         .collect::<Result<Vec<CommandRule>, _>>()?;
 
-    let approval = convert_approval(&raw_name, raw_grant.approval, approval_transports)?;
+    let approval = convert_approval(&raw_name, raw_grant.approval)?;
 
     GrantPolicy::new(name, provider, requesters, commands, approval).map_err(|error| {
         ConfigError::InvalidGrantPolicy {
@@ -1098,11 +1117,7 @@ fn convert_grant(
     })
 }
 
-fn convert_approval(
-    grant: &str,
-    raw: String,
-    approval_transports: &[ApprovalTransportName],
-) -> Result<ApprovalPolicy, ConfigError> {
+fn convert_approval(grant: &str, raw: String) -> Result<ApprovalPolicy, ConfigError> {
     if raw == "grant" {
         return Ok(ApprovalPolicy::grant());
     }
@@ -1117,16 +1132,6 @@ fn convert_approval(
         if transport.is_empty() {
             return Err(ConfigError::MissingJitTransport {
                 grant: grant.to_owned(),
-            });
-        }
-
-        if !approval_transports
-            .iter()
-            .any(|candidate| candidate.as_str() == transport)
-        {
-            return Err(ConfigError::UnknownApprovalTransport {
-                grant: grant.to_owned(),
-                transport: transport.to_owned(),
             });
         }
 
@@ -1146,6 +1151,80 @@ fn convert_approval(
     })
 }
 
+fn convert_approval_transport(
+    raw_name: String,
+    raw: RawApprovalTransport,
+) -> Result<ApprovalTransportConfig, ConfigError> {
+    let name = ApprovalTransportName::new(&raw_name).map_err(|error| {
+        ConfigError::InvalidApprovalTransportName {
+            name: raw_name.clone(),
+            message: error.to_string(),
+        }
+    })?;
+
+    let kind = match raw.transport_type.as_str() {
+        "slack" => {
+            let channel = raw
+                .channel
+                .filter(|channel| !channel.is_empty())
+                .ok_or_else(|| ConfigError::InvalidApprovalTransport {
+                    transport: raw_name.clone(),
+                    message: "slack transport requires channel".to_owned(),
+                })?;
+            ApprovalTransportKind::Slack { channel }
+        }
+        transport_type => {
+            return Err(ConfigError::InvalidApprovalTransport {
+                transport: raw_name,
+                message: format!("unknown transport type {transport_type}"),
+            });
+        }
+    };
+
+    let options = convert_approval_options(&raw_name, raw.options)?;
+
+    Ok(ApprovalTransportConfig {
+        name,
+        kind,
+        options,
+    })
+}
+
+fn convert_approval_options(
+    transport: &str,
+    raw_options: Vec<String>,
+) -> Result<Vec<ApprovalOption>, ConfigError> {
+    let mut option_ids = BTreeSet::new();
+    let mut options = Vec::with_capacity(raw_options.len());
+
+    for option in raw_options {
+        if option.is_empty() {
+            return Err(ConfigError::InvalidApprovalTransport {
+                transport: transport.to_owned(),
+                message: "approval option id cannot be empty".to_owned(),
+            });
+        }
+
+        if !option_ids.insert(option.clone()) {
+            return Err(ConfigError::InvalidApprovalTransport {
+                transport: transport.to_owned(),
+                message: format!("approval option {option} is duplicated"),
+            });
+        }
+
+        ApprovalTransportName::new(&option).map_err(|error| {
+            ConfigError::InvalidApprovalTransport {
+                transport: transport.to_owned(),
+                message: format!("approval option {option} is invalid: {error}"),
+            }
+        })?;
+
+        options.push(ApprovalOption::new(&option, format!("Approve {option}")));
+    }
+
+    Ok(options)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -1156,9 +1235,9 @@ mod tests {
     use heim_core::ApprovalMode;
 
     use super::{
-        ConfigError, LocalAuthSecret, ProviderConfig, default_audit_log_file_from_env,
-        default_log_dir_from_env, default_policy_dir_from_env, load_auth_file, load_policy_dir,
-        parse_auth_json_str, parse_config_str, parse_policy_str,
+        ApprovalTransportKind, ConfigError, LocalAuthSecret, ProviderConfig,
+        default_audit_log_file_from_env, default_log_dir_from_env, default_policy_dir_from_env,
+        load_auth_file, load_policy_dir, parse_auth_json_str, parse_config_str, parse_policy_str,
     };
 
     const VALID_POLICY: &str = r##"
@@ -1168,13 +1247,9 @@ provider = "aws_prod"
 allow = ["codex", "*"]
 commands = ["aws *"]
 approval = "jit:slack"
-
-[approval_transports.slack]
-type = "slack"
-channel = "#heim-approvals"
 "##;
 
-    const VALID_CONFIG: &str = r#"
+    const VALID_CONFIG: &str = r##"
 [providers.aws_prod]
 type = "aws_sts"
 role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
@@ -1192,7 +1267,12 @@ repositories = ["drymn/backend"]
 [providers.github_personal]
 type = "github_pat"
 token = { auth = "github_personal_pat" }
-"#;
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "60m"]
+"##;
 
     const VALID_AUTH: &str = r#"
 {
@@ -1237,6 +1317,17 @@ token = { auth = "github_personal_pat" }
             panic!("github pat provider");
         };
         assert_eq!(provider.token.as_str(), "github_personal_pat");
+
+        let transport = config.approval_transport("slack").expect("slack transport");
+        assert_eq!(
+            transport.kind,
+            ApprovalTransportKind::Slack {
+                channel: "#heim-approvals".to_owned()
+            }
+        );
+        assert_eq!(transport.options[0].id, "15m");
+        assert_eq!(transport.options[0].label, "Approve 15m");
+        assert_eq!(transport.options[1].id, "60m");
     }
 
     #[test]
@@ -1398,8 +1489,6 @@ approval = "grant"
         let document = parse_policy_str(VALID_POLICY).expect("valid policy");
 
         assert_eq!(document.grants.len(), 1);
-        assert_eq!(document.approval_transports.len(), 1);
-
         let grant = &document.grants[0];
         assert_eq!(grant.name.as_str(), "aws.prod-readonly");
         assert_eq!(grant.provider.as_str(), "aws_prod");
@@ -1426,8 +1515,8 @@ approval = "jit"
     }
 
     #[test]
-    fn rejects_unknown_approval_transport() {
-        let error = parse_policy_str(
+    fn rejects_unknown_approval_transport_during_config_cross_check() {
+        let policy = parse_policy_str(
             r#"
 [[grants]]
 name = "aws.prod-readonly"
@@ -1437,12 +1526,70 @@ commands = ["aws *"]
 approval = "jit:slack"
 "#,
         )
-        .expect_err("unknown transport");
+        .expect("policy with transport ref");
+        let config = parse_config_str(
+            r#"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+"#,
+        )
+        .expect("config without approval transport");
+
+        let error =
+            super::validate_policy_provider_refs(&policy, &config).expect_err("unknown transport");
 
         assert!(matches!(
             error,
             ConfigError::UnknownApprovalTransport { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_slack_transport_without_channel() {
+        let error = parse_config_str(
+            r#"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+
+[approval_transports.slack]
+type = "slack"
+"#,
+        )
+        .expect_err("missing slack channel");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidApprovalTransport { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_approval_option_ids() {
+        let error = parse_config_str(
+            r##"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "15m"]
+"##,
+        )
+        .expect_err("duplicate approval option");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidApprovalTransport { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("approval option 15m is duplicated")
+        );
     }
 
     #[test]
@@ -1513,14 +1660,7 @@ approval = "grant"
 
     #[test]
     fn rejects_policy_without_grants() {
-        let error = parse_policy_str(
-            r##"
-[approval_transports.slack]
-type = "slack"
-channel = "#heim-approvals"
-"##,
-        )
-        .expect_err("missing grants");
+        let error = parse_policy_str("").expect_err("missing grants");
 
         assert!(matches!(error, ConfigError::MissingGrants));
     }
@@ -1681,14 +1821,6 @@ approval = "grant"
     fn loads_policy_directory_from_multiple_toml_files() {
         let dir = TempPolicyDir::new();
         dir.write(
-            "approval.toml",
-            r##"
-[approval_transports.slack]
-type = "slack"
-channel = "#heim-approvals"
-"##,
-        );
-        dir.write(
             "aws.toml",
             r#"
 [[grants]]
@@ -1710,21 +1842,12 @@ this is ignored
 
         assert_eq!(document.grants.len(), 1);
         assert_eq!(document.grants[0].name.as_str(), "aws.prod-readonly");
-        assert_eq!(document.approval_transports.len(), 1);
-        assert_eq!(document.approval_transports[0].as_str(), "slack");
     }
 
     #[test]
     fn rejects_policy_directory_without_grants() {
         let dir = TempPolicyDir::new();
-        dir.write(
-            "approval.toml",
-            r##"
-[approval_transports.slack]
-type = "slack"
-channel = "#heim-approvals"
-"##,
-        );
+        dir.write("empty.toml", "");
 
         let error = load_policy_dir(dir.path()).expect_err("missing grants");
 
@@ -1760,46 +1883,6 @@ approval = "grant"
         let error = load_policy_dir(dir.path()).expect_err("duplicate grant");
 
         assert!(matches!(error, ConfigError::DuplicateGrantName { .. }));
-    }
-
-    #[test]
-    fn rejects_duplicate_approval_transports_across_policy_directory() {
-        let dir = TempPolicyDir::new();
-        dir.write(
-            "one.toml",
-            r#"
-[[grants]]
-name = "aws.prod-readonly"
-provider = "aws_prod"
-allow = ["codex"]
-commands = ["aws *"]
-approval = "grant"
-
-[approval_transports.slack]
-type = "slack"
-"#,
-        );
-        dir.write(
-            "two.toml",
-            r#"
-[[grants]]
-name = "github.personal-readonly"
-provider = "github_personal"
-allow = ["gh"]
-commands = ["gh pr view *"]
-approval = "grant"
-
-[approval_transports.slack]
-type = "slack"
-"#,
-        );
-
-        let error = load_policy_dir(dir.path()).expect_err("duplicate transport");
-
-        assert!(matches!(
-            error,
-            ConfigError::DuplicateApprovalTransport { .. }
-        ));
     }
 
     #[test]

@@ -29,7 +29,16 @@ request id, requester, command, and current working directory before it can be
 sent to a transport.
 
 Approval options are configured by the approval provider or transport
-integration. The common model keeps them generic:
+integration. `config.toml` uses the compact form:
+
+```toml
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+options = ["15m", "60m"]
+```
+
+The config loader maps each option to the common request model:
 
 ```text
 id = "15m"
@@ -64,10 +73,15 @@ provider = "aws_prod"
 allow = ["codex"]
 commands = ["aws *"]
 approval = "jit:slack"
+```
 
+The transport itself lives in `config.toml`:
+
+```toml
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+options = ["15m", "60m"]
 ```
 
 Slack is the first planned v0 transport. The contract intentionally does not

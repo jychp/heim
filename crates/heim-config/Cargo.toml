@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+heim-approvals = { version = "0.1.0", path = "../heim-approvals" }
 heim-core = { version = "0.1.0", path = "../heim-core" }
 serde.workspace = true
 serde_json.workspace = true
