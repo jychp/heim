@@ -5,8 +5,9 @@ optional unsafe local auth entries. The current implementation validates
 config, provider, approval transport, and unsafe local auth file schemas. It
 can also prepare JIT approval requests from configured transports, resolve a
 GitHub PAT from unsafe local auth, and inject it into allowed `heim exec` child
-processes. It does not call AWS, call GitHub, mint GitHub App tokens, call
-Slack, or request approvals yet.
+processes. It can apply approval provider decisions, but does not call AWS,
+call GitHub, mint GitHub App tokens, call Slack, or request approvals through a
+built-in transport yet.
 
 ## Config File
 

@@ -6,7 +6,8 @@ approval backend.
 
 The current implementation defines the contract in `heim-approvals`. `heim
 exec` can prepare approval requests from a JIT policy decision and configured
-transport options. It does not call Slack or any external approval system yet.
+transport options, then apply a decision returned by an approval provider. It
+does not call Slack or any external approval system yet.
 
 ## Request
 
@@ -63,6 +64,18 @@ Transport failures are separate errors. The default product posture remains
 fail closed: when approval cannot be obtained, Heim must not start the wrapped
 command or issue credentials.
 
+`heim exec` currently handles these decisions:
+
+- `approved` continues to credential issuance and command execution
+- `approved_with_option` continues when the selected option was configured for
+  the transport
+- `denied` fails closed
+- `timed_out` fails closed
+
+Approval provider errors also fail closed.
+For `approved_with_option`, the selected option id must match one of the
+options configured for the transport.
+
 ## Transports
 
 Policy references transports by name:
@@ -90,7 +103,6 @@ encode Slack-only fields in the common request or decision types.
 
 ## Current Limitations
 
-`heim exec` still fails closed when a grant requires JIT approval. It builds
-the transport-neutral approval request first, so runtime approval dispatch can
-use the same request shape later. Slack API calls, approval timeouts, and
-post-approval credential issuance are intentionally deferred.
+`heim exec` still fails closed with the default runtime when a grant requires
+JIT approval because no built-in approval transport dispatch is implemented
+yet. Slack API calls and real approval timeouts are intentionally deferred.

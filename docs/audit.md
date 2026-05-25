@@ -38,8 +38,8 @@ The current decision model covers the expected v0 lifecycle:
 - `CommandCompleted`
 - `Failed`
 
-These are event labels only. They do not imply that approval calls, provider
-calls, command execution, or CLI integration are implemented.
+These are event labels only. They do not imply that external approval transport
+calls, provider calls, command execution, or CLI integration are implemented.
 
 `heim exec` currently emits the policy preflight decisions:
 
