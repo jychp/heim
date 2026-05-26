@@ -665,6 +665,37 @@ mod tests {
     }
 
     #[test]
+    fn github_app_provider_propagates_client_error_without_printing_secret() {
+        let provider = GithubAppProvider::from_secret_with_jwt_for_tests(
+            123456,
+            987654,
+            Vec::new(),
+            ResolvedSecret::GithubAppPrivateKey {
+                pem: "secret-pem".to_owned(),
+            },
+            FailingGithubAppClient,
+            "signed-jwt",
+        )
+        .expect("provider");
+        let request = CredentialRequest::new(
+            "github.drymn-pr-write",
+            "github_drymn",
+            "gh",
+            ["gh", "pr", "view", "42"],
+            PathBuf::from("/workspace"),
+        );
+
+        let error = provider.issue(&request).expect_err("client error");
+
+        assert_eq!(
+            error.to_string(),
+            "provider github_app request failed: GitHub API returned status 403 Forbidden"
+        );
+        assert!(!format!("{error:?}").contains("secret-pem"));
+        assert!(!format!("{error:?}").contains("signed-jwt"));
+    }
+
+    #[test]
     fn github_app_token_request_uses_repository_names() {
         let request =
             super::GithubAppTokenRequest::new(&["drymn/backend".to_owned(), "worker".to_owned()]);
@@ -702,6 +733,23 @@ mod tests {
                 .push((jwt.to_owned(), installation_id, repositories.to_vec()));
             Ok(GithubAppInstallationToken {
                 token: self.token.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FailingGithubAppClient;
+
+    impl GithubAppClient for FailingGithubAppClient {
+        fn create_installation_token(
+            &self,
+            _jwt: &str,
+            _installation_id: u64,
+            _repositories: &[String],
+        ) -> Result<GithubAppInstallationToken, ProviderError> {
+            Err(ProviderError::Http {
+                provider: "github_app",
+                message: "GitHub API returned status 403 Forbidden".to_owned(),
             })
         }
     }

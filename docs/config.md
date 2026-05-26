@@ -125,6 +125,9 @@ Optional:
 Repository values may be written as repository names or `owner/name` slugs.
 GitHub's installation token API receives repository names, so Heim strips the
 owner prefix when calling GitHub.
+GitHub App permissions and repository access are configured in GitHub. Heim
+uses the configured app and installation IDs, but does not infer or expand
+permissions.
 
 `github_pat` config describes a GitHub PAT provider. PATs are supported for
 compatibility, but GitHub App installation tokens are preferred.
