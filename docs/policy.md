@@ -186,9 +186,9 @@ heim exec --dir examples/policies aws.prod-readonly -- aws sts get-caller-identi
 When every requested grant is allowed directly by policy, Heim resolves the
 configured providers, injects supported credentials into the child process, and
 returns the command exit code. The current provider issuer supports
-`github_pat` only, mapping the resolved PAT to `GH_TOKEN` and `GITHUB_TOKEN`.
-AWS STS and GitHub App providers fail closed until their issuer implementations
-are added.
+`github_app` and `github_pat`, mapping the issued GitHub token to `GH_TOKEN`
+and `GITHUB_TOKEN`. AWS STS providers fail closed until their issuer
+implementation is added.
 
 Injected variables override same-named parent environment variables for the
 wrapped command only.
@@ -211,7 +211,6 @@ During preflight, Heim also builds a local execution context:
 - Git remote and branch when the command is run inside a Git repository
 
 This context feeds current audit events and prepared approval requests, and is
-intended to feed future provider requests. Heim does not send it to Slack,
-contact AWS or GitHub, or mint GitHub App installation tokens yet. Git metadata
-detection is best-effort; Heim continues without it when `git` is unavailable
-or the current directory is not a Git repository.
+intended to feed future provider requests. Heim does not send it to Slack or
+contact AWS yet. Git metadata detection is best-effort; Heim continues without
+it when `git` is unavailable or the current directory is not a Git repository.
