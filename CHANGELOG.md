@@ -46,6 +46,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   process-scoped `GH_TOKEN` and `GITHUB_TOKEN` environment injection.
 - GitHub PAT credential issuance for allowed `heim exec` requests, with
   process-scoped `GH_TOKEN` and `GITHUB_TOKEN` environment injection.
+- `heim audit list` for reading local audit JSONL events from the default log
+  file or an explicit file.
 - Minimal `cargo-deny` policy for dependency license, advisory, and source
   checks, wired into GitHub Actions.
 
