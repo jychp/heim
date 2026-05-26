@@ -3,7 +3,8 @@
 Heim audit events describe local security-relevant decisions and credential
 issuance metadata. The current implementation defines the typed event model in
 `heim-audit` and can append those events to a local JSONL file. `heim exec`
-emits policy preflight audit events. It does not expose `heim audit` yet.
+emits policy preflight audit events. `heim audit list` can read local audit
+events from the default audit log file or an explicit JSONL file.
 
 ## Event Scope
 
@@ -39,7 +40,8 @@ The current decision model covers the expected v0 lifecycle:
 - `Failed`
 
 These are event labels only. They do not imply that external approval transport
-calls, provider calls, command execution, or CLI integration are implemented.
+calls, provider calls, or command execution are implemented for every event
+stage.
 
 `heim exec` currently emits the policy preflight decisions:
 
@@ -88,5 +90,19 @@ The default audit log file is:
 
 The sink creates the `logs` directory when it writes. `heim exec` fails if it
 cannot write the preflight audit event. For directly allowed requests, the
-audit event is written before the wrapped command starts. Audit log viewing
-through `heim audit` is intentionally deferred.
+audit event is written before the wrapped command starts.
+
+`heim audit list` reads the default audit log file:
+
+```bash
+heim audit list
+```
+
+For local testing, it can read an explicit JSONL file:
+
+```bash
+heim audit list --file /path/to/audit.jsonl
+```
+
+If the file does not exist, Heim treats the audit log as empty. If a JSONL line
+is malformed, Heim reports the file and line number.

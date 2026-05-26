@@ -83,9 +83,22 @@ enum Command {
         command: Option<PolicyCommand>,
     },
     /// Inspect local audit events.
-    Audit,
+    Audit {
+        #[command(subcommand)]
+        command: Option<AuditCommand>,
+    },
     /// Inspect and manage approval requests.
     Approvals,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// List local audit events.
+    List {
+        /// Audit JSONL file to read instead of the default audit log file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -285,7 +298,7 @@ where
         ),
         Some(Command::Config { command }) => run_config(command),
         Some(Command::Policy { command }) => run_policy(command),
-        Some(Command::Audit) => not_implemented("heim audit is not implemented yet\n"),
+        Some(Command::Audit { command }) => run_audit(command),
         Some(Command::Approvals) => not_implemented("heim approvals is not implemented yet\n"),
         None => {
             let mut command = Cli::command();
@@ -455,6 +468,27 @@ where
     }
 
     run_exec_preflight(preflight, credentials, execute_command)
+}
+
+fn run_audit(command: Option<AuditCommand>) -> CommandResult {
+    match command {
+        Some(AuditCommand::List { file }) => {
+            let events = match file {
+                Some(file) => heim_audit::read_audit_events(file),
+                None => heim_audit::read_default_audit_events(),
+            };
+
+            match events {
+                Ok(events) => ok(format_audit_events(&events)),
+                Err(error) => CommandResult {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: format!("{error}\n"),
+                },
+            }
+        }
+        None => not_implemented("heim audit is not implemented yet\n"),
+    }
 }
 
 fn run_policy(command: Option<PolicyCommand>) -> CommandResult {
@@ -1206,6 +1240,54 @@ impl std::error::Error for ExecCredentialError {
     }
 }
 
+fn format_audit_events(events: &[heim_audit::AuditEvent]) -> String {
+    if events.is_empty() {
+        return "audit: no events\n".to_owned();
+    }
+
+    let mut output = String::new();
+    for event in events {
+        let grants = if event.grants.is_empty() {
+            "-".to_owned()
+        } else {
+            event
+                .grants
+                .iter()
+                .map(|grant| grant.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let command = if event.command.is_empty() {
+            "-".to_owned()
+        } else {
+            event.command.join(" ")
+        };
+
+        output.push_str(&format!(
+            "{} {} requester={} grants={} command={}\n",
+            event.timestamp,
+            audit_decision_label(&event.decision),
+            event.requester,
+            grants,
+            command
+        ));
+    }
+
+    output
+}
+
+fn audit_decision_label(decision: &heim_audit::AuditDecision) -> &'static str {
+    match decision {
+        heim_audit::AuditDecision::Allow => "allow",
+        heim_audit::AuditDecision::Deny { .. } => "deny",
+        heim_audit::AuditDecision::RequireApproval { .. } => "require_approval",
+        heim_audit::AuditDecision::Approved => "approved",
+        heim_audit::AuditDecision::CredentialsIssued => "credentials_issued",
+        heim_audit::AuditDecision::CommandCompleted { .. } => "command_completed",
+        heim_audit::AuditDecision::Failed { .. } => "failed",
+    }
+}
+
 fn format_policy_decision(decision: PolicyDecision) -> CommandResult {
     match decision {
         PolicyDecision::Allow => ok("policy: allow\n"),
@@ -1457,6 +1539,78 @@ approval = "grant"
             super::format_unix_timestamp(0, 0),
             "1970-01-01T00:00:00.000000000Z"
         );
+    }
+
+    #[test]
+    fn audit_list_reads_events_from_file() {
+        let file = TestFile::new("audit", "");
+        let sink = heim_audit::JsonlAuditSink::new(file.path());
+        sink.append(
+            &sample_audit_event().with_grants([heim_audit::AuditGrant::new(
+                "github.personal-readonly",
+                "github",
+                false,
+            )]),
+        )
+        .expect("append audit event");
+
+        let result = run_from([
+            "heim",
+            "audit",
+            "list",
+            "--file",
+            file.path().to_str().expect("utf-8 path"),
+        ]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(
+            result.stdout,
+            "2026-05-24T12:00:00Z allow requester=gh grants=github.personal-readonly command=gh pr view 42\n"
+        );
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn audit_list_treats_missing_file_as_empty_log() {
+        let file = std::env::temp_dir().join(format!(
+            "heim-cli-missing-audit-{}-{}.jsonl",
+            std::process::id(),
+            0
+        ));
+        let result = run_from([
+            "heim",
+            "audit",
+            "list",
+            "--file",
+            file.to_str().expect("utf-8 path"),
+        ]);
+
+        assert_eq!(result.code, 0);
+        assert_eq!(result.stdout, "audit: no events\n");
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn audit_list_reports_invalid_jsonl_line() {
+        let file = TestFile::new(
+            "audit",
+            r#"{"request_id":"req","timestamp":"2026-05-24T12:00:00Z","requester":"gh","command":["gh"],"cwd":"/workspace","git":null,"grants":[],"decision":{"type":"allow"},"approval":null,"policy_version":null,"heim_version":"0.1.0"}
+not-json
+"#,
+        );
+
+        let result = run_from([
+            "heim",
+            "audit",
+            "list",
+            "--file",
+            file.path().to_str().expect("utf-8 path"),
+        ]);
+
+        assert_eq!(result.code, 2);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.contains("failed to parse audit log file"));
+        assert!(result.stderr.contains("line 2"));
     }
 
     #[test]
@@ -2154,13 +2308,22 @@ approval = "grant"
 
     #[test]
     fn future_commands_are_parsed_but_not_implemented() {
-        for command in ["config", "audit", "approvals"] {
+        for command in ["config", "approvals"] {
             let result = run_from(["heim", command]);
 
             assert_eq!(result.code, 2);
             assert!(result.stdout.is_empty());
             assert!(result.stderr.contains("not implemented yet"));
         }
+    }
+
+    #[test]
+    fn audit_without_subcommand_is_not_implemented_yet() {
+        let result = run_from(["heim", "audit"]);
+
+        assert_eq!(result.code, 2);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.contains("not implemented yet"));
     }
 
     #[test]

@@ -41,15 +41,16 @@ heim policy
 heim policy validate
 heim policy check aws.prod-readonly --requester codex -- aws sts get-caller-identity
 heim audit
+heim audit list
 heim approvals
 ```
 
 Only `doctor`, `config validate`, `policy validate`, `policy check`, `exec`
 policy preflight, approval request preparation, GitHub PAT environment
 injection for allowed `exec` requests, approval decision handling, allowed
-command execution, `--help`, and `--version` are implemented today. The other
-commands are parsed and return an explicit "not implemented yet" error until
-their behavior is accepted.
+command execution, `audit list`, `--help`, and `--version` are implemented
+today. The other commands are parsed and return an explicit "not implemented
+yet" error until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -186,7 +187,13 @@ local audit event for the policy preflight decision and records redacted
 credential carrier metadata for issued GitHub App and GitHub PAT grants. It
 does not contact AWS, request approvals through Slack, or issue AWS STS
 credentials yet.
-`heim audit` does not read audit events yet.
+
+Local audit events can be listed with:
+
+```bash
+heim audit list
+heim audit list --file /path/to/audit.jsonl
+```
 
 See `docs/policy.md`, `docs/config.md`, `examples/policy.toml`, and
 `examples/config.toml` for the current policy and provider model drafts.

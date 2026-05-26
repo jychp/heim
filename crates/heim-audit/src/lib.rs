@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::fs::OpenOptions;
+use std::io::BufRead;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -265,6 +266,49 @@ impl JsonlAuditSink {
     }
 }
 
+/// Read Heim's default local audit JSONL file.
+pub fn read_default_audit_events() -> Result<Vec<AuditEvent>, AuditReadError> {
+    read_audit_events(default_audit_log_file()?)
+}
+
+/// Read local audit events from one JSONL file.
+pub fn read_audit_events(path: impl AsRef<Path>) -> Result<Vec<AuditEvent>, AuditReadError> {
+    let path = path.as_ref();
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(AuditReadError::OpenFile {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut events = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.map_err(|source| AuditReadError::ReadLine {
+            path: path.display().to_string(),
+            line: line_number,
+            source,
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event = serde_json::from_str(&line).map_err(|source| AuditReadError::ParseLine {
+            path: path.display().to_string(),
+            line: line_number,
+            source,
+        })?;
+        events.push(event);
+    }
+
+    Ok(events)
+}
+
 /// Error raised while writing local audit logs.
 #[derive(Debug)]
 pub enum AuditLogError {
@@ -325,6 +369,66 @@ impl From<heim_config::ConfigError> for AuditLogError {
     }
 }
 
+/// Error raised while reading local audit logs.
+#[derive(Debug)]
+pub enum AuditReadError {
+    Config(heim_config::ConfigError),
+    OpenFile {
+        path: String,
+        source: std::io::Error,
+    },
+    ReadLine {
+        path: String,
+        line: usize,
+        source: std::io::Error,
+    },
+    ParseLine {
+        path: String,
+        line: usize,
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for AuditReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(source) => write!(formatter, "failed to resolve audit log path: {source}"),
+            Self::OpenFile { path, source } => {
+                write!(formatter, "failed to open audit log file {path}: {source}")
+            }
+            Self::ReadLine { path, line, source } => {
+                write!(
+                    formatter,
+                    "failed to read audit log file {path} line {line}: {source}"
+                )
+            }
+            Self::ParseLine { path, line, source } => {
+                write!(
+                    formatter,
+                    "failed to parse audit log file {path} line {line}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuditReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::OpenFile { source, .. } => Some(source),
+            Self::ReadLine { source, .. } => Some(source),
+            Self::ParseLine { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<heim_config::ConfigError> for AuditReadError {
+    fn from(source: heim_config::ConfigError) -> Self {
+        Self::Config(source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -335,7 +439,7 @@ mod tests {
 
     use super::{
         AuditApproval, AuditCredentialMetadata, AuditDecision, AuditEvent, AuditGitContext,
-        AuditGrant, JsonlAuditSink,
+        AuditGrant, AuditReadError, JsonlAuditSink, read_audit_events,
     };
 
     #[test]
@@ -526,6 +630,59 @@ mod tests {
 
         assert_eq!(first["request_id"], "req-7");
         assert_eq!(second["decision"]["type"], "command_completed");
+    }
+
+    #[test]
+    fn jsonl_reader_reads_one_event_per_line() {
+        let dir = TempAuditDir::new();
+        let log = dir.path().join("audit.jsonl");
+        let sink = JsonlAuditSink::new(&log);
+        sink.append(&sample_event("req-9", AuditDecision::Allow))
+            .expect("append first event");
+        sink.append(&sample_event(
+            "req-10",
+            AuditDecision::CommandCompleted { exit_code: Some(0) },
+        ))
+        .expect("append second event");
+
+        let events = read_audit_events(&log).expect("read audit events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].request_id, "req-9");
+        assert_eq!(
+            events[1].decision,
+            AuditDecision::CommandCompleted { exit_code: Some(0) }
+        );
+    }
+
+    #[test]
+    fn jsonl_reader_treats_missing_file_as_empty_log() {
+        let dir = TempAuditDir::new();
+        let log = dir.path().join("missing.jsonl");
+
+        let events = read_audit_events(log).expect("missing audit log");
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn jsonl_reader_reports_invalid_line_number() {
+        let dir = TempAuditDir::new();
+        let log = dir.path().join("audit.jsonl");
+        fs::write(
+            &log,
+            format!(
+                "{}\nnot-json\n",
+                serde_json::to_string(&sample_event("req-11", AuditDecision::Allow))
+                    .expect("serialize event")
+            ),
+        )
+        .expect("write audit log");
+
+        let error = read_audit_events(&log).expect_err("invalid audit line");
+
+        assert!(matches!(error, AuditReadError::ParseLine { line: 2, .. }));
+        assert!(error.to_string().contains("line 2"));
     }
 
     #[test]
