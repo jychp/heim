@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use heim_sources::ResolvedSecret;
@@ -313,9 +314,18 @@ pub trait GithubAppClient {
 }
 
 /// GitHub App installation token returned by the GitHub API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GithubAppInstallationToken {
     pub token: String,
+}
+
+impl fmt::Debug for GithubAppInstallationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GithubAppInstallationToken")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +342,7 @@ impl GithubAppClient for ReqwestGithubAppClient {
             format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
         let response = reqwest::blocking::Client::new()
             .post(url)
+            .timeout(Duration::from_secs(30))
             .header("Accept", "application/vnd.github+json")
             .header("Authorization", format!("Bearer {jwt}"))
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -662,6 +673,18 @@ mod tests {
 
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("secret-pem"));
+    }
+
+    #[test]
+    fn github_app_installation_token_debug_redacts_secret() {
+        let token = GithubAppInstallationToken {
+            token: "ghs_installation_secret".to_owned(),
+        };
+
+        let debug = format!("{token:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("ghs_installation_secret"));
     }
 
     #[test]
