@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_config::BehaviorVersion;
 use heim_sources::ResolvedSecret;
 use serde::{Deserialize, Serialize};
 
@@ -158,6 +159,287 @@ pub struct CredentialMetadata {
 /// Common behavior for credential providers.
 pub trait CredentialProvider {
     fn issue(&self, request: &CredentialRequest) -> Result<IssuedCredential, ProviderError>;
+}
+
+/// AWS STS AssumeRole provider.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AwsStsProvider<C = SdkAwsStsClient> {
+    role_arn: String,
+    region: Option<String>,
+    duration_seconds: Option<i32>,
+    source_profile: Option<String>,
+    session_name: Option<String>,
+    external_id: Option<String>,
+    client: C,
+}
+
+impl<C> AwsStsProvider<C> {
+    pub fn new(
+        role_arn: impl Into<String>,
+        region: Option<String>,
+        duration: Option<String>,
+        source_profile: Option<String>,
+        session_name: Option<String>,
+        external_id: Option<String>,
+        client: C,
+    ) -> Result<Self, ProviderError> {
+        let role_arn = role_arn.into();
+        if role_arn.trim().is_empty() {
+            return Err(ProviderError::InvalidProviderConfig {
+                provider: "aws_sts",
+                message: "role ARN is required".to_owned(),
+            });
+        }
+
+        let duration_seconds = duration
+            .as_deref()
+            .map(parse_aws_duration_seconds)
+            .transpose()?;
+
+        Ok(Self {
+            role_arn,
+            region,
+            duration_seconds,
+            source_profile,
+            session_name,
+            external_id,
+            client,
+        })
+    }
+}
+
+impl AwsStsProvider {
+    pub fn with_default_client(
+        role_arn: impl Into<String>,
+        region: Option<String>,
+        duration: Option<String>,
+        source_profile: Option<String>,
+        session_name: Option<String>,
+        external_id: Option<String>,
+    ) -> Result<Self, ProviderError> {
+        Self::new(
+            role_arn,
+            region,
+            duration,
+            source_profile,
+            session_name,
+            external_id,
+            SdkAwsStsClient,
+        )
+    }
+}
+
+impl<C> fmt::Debug for AwsStsProvider<C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AwsStsProvider")
+            .field("role_arn", &self.role_arn)
+            .field("region", &self.region)
+            .field("duration_seconds", &self.duration_seconds)
+            .field("source_profile", &self.source_profile)
+            .field("session_name", &self.session_name)
+            .field("external_id", &self.external_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C> CredentialProvider for AwsStsProvider<C>
+where
+    C: AwsStsClient,
+{
+    fn issue(&self, request: &CredentialRequest) -> Result<IssuedCredential, ProviderError> {
+        let session_name = self
+            .session_name
+            .clone()
+            .unwrap_or_else(|| default_aws_session_name(request));
+        let assume_role = AwsStsAssumeRoleRequest {
+            role_arn: self.role_arn.clone(),
+            region: self.region.clone(),
+            duration_seconds: self.duration_seconds,
+            source_profile: self.source_profile.clone(),
+            session_name,
+            external_id: self.external_id.clone(),
+        };
+        let session = self.client.assume_role(&assume_role)?;
+        let mut credential = IssuedCredential::new("aws_sts")
+            .with_env_var("AWS_ACCESS_KEY_ID", session.access_key_id)
+            .with_env_var("AWS_SECRET_ACCESS_KEY", session.secret_access_key)
+            .with_env_var("AWS_SESSION_TOKEN", session.session_token);
+
+        if let Some(region) = &self.region {
+            credential = credential
+                .with_env_var("AWS_REGION", region.clone())
+                .with_env_var("AWS_DEFAULT_REGION", region.clone());
+        }
+
+        Ok(credential)
+    }
+}
+
+/// AWS STS AssumeRole request built from provider config and exec context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsStsAssumeRoleRequest {
+    pub role_arn: String,
+    pub region: Option<String>,
+    pub duration_seconds: Option<i32>,
+    pub source_profile: Option<String>,
+    pub session_name: String,
+    pub external_id: Option<String>,
+}
+
+/// Redacted AWS STS credentials returned by an AssumeRole client.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AwsStsSessionCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+}
+
+impl AwsStsSessionCredentials {
+    pub fn new(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        session_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            session_token: session_token.into(),
+        }
+    }
+}
+
+impl fmt::Debug for AwsStsSessionCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AwsStsSessionCredentials")
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field("session_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// HTTP boundary used by the AWS STS provider.
+pub trait AwsStsClient {
+    fn assume_role(
+        &self,
+        request: &AwsStsAssumeRoleRequest,
+    ) -> Result<AwsStsSessionCredentials, ProviderError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdkAwsStsClient;
+
+impl AwsStsClient for SdkAwsStsClient {
+    fn assume_role(
+        &self,
+        request: &AwsStsAssumeRoleRequest,
+    ) -> Result<AwsStsSessionCredentials, ProviderError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| ProviderError::Runtime {
+                provider: "aws_sts",
+                message: source.to_string(),
+            })?;
+
+        runtime.block_on(assume_role_with_sdk(request))
+    }
+}
+
+async fn assume_role_with_sdk(
+    request: &AwsStsAssumeRoleRequest,
+) -> Result<AwsStsSessionCredentials, ProviderError> {
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(region) = &request.region {
+        loader = loader.region(aws_config::Region::new(region.clone()));
+    }
+    if let Some(source_profile) = &request.source_profile {
+        loader = loader.profile_name(source_profile);
+    }
+
+    let shared_config = loader.load().await;
+    let client = aws_sdk_sts::Client::new(&shared_config);
+    let mut builder = client
+        .assume_role()
+        .role_arn(&request.role_arn)
+        .role_session_name(&request.session_name);
+
+    if let Some(duration_seconds) = request.duration_seconds {
+        builder = builder.duration_seconds(duration_seconds);
+    }
+    if let Some(external_id) = &request.external_id {
+        builder = builder.external_id(external_id);
+    }
+
+    let output = builder.send().await.map_err(|source| ProviderError::Http {
+        provider: "aws_sts",
+        message: source.to_string(),
+    })?;
+    let credentials = output.credentials().ok_or_else(|| ProviderError::Http {
+        provider: "aws_sts",
+        message: "AWS STS returned no credentials".to_owned(),
+    })?;
+
+    Ok(AwsStsSessionCredentials::new(
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+        credentials.session_token(),
+    ))
+}
+
+fn parse_aws_duration_seconds(value: &str) -> Result<i32, ProviderError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ProviderError::InvalidProviderConfig {
+            provider: "aws_sts",
+            message: "duration cannot be empty".to_owned(),
+        });
+    }
+
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600)
+    } else {
+        (value, 1)
+    };
+    let number = number
+        .parse::<i32>()
+        .map_err(|source| ProviderError::InvalidProviderConfig {
+            provider: "aws_sts",
+            message: format!("duration {value} is invalid: {source}"),
+        })?;
+
+    number
+        .checked_mul(multiplier)
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| ProviderError::InvalidProviderConfig {
+            provider: "aws_sts",
+            message: format!("duration {value} is invalid"),
+        })
+}
+
+fn default_aws_session_name(request: &CredentialRequest) -> String {
+    let mut session_name = String::from("heim-");
+    for character in request.requester.chars() {
+        if character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '+' | '=' | ',' | '.' | '@' | '-')
+        {
+            session_name.push(character);
+        } else {
+            session_name.push('-');
+        }
+    }
+
+    if session_name.len() < 2 {
+        session_name.push_str("exec");
+    }
+    session_name.truncate(64);
+    session_name
 }
 
 /// GitHub PAT pass-through provider.
@@ -462,6 +744,10 @@ pub enum ProviderError {
         provider: String,
         provider_type: &'static str,
     },
+    InvalidProviderConfig {
+        provider: &'static str,
+        message: String,
+    },
     SecretKindMismatch {
         provider: String,
         actual: String,
@@ -479,6 +765,10 @@ pub enum ProviderError {
         provider: &'static str,
         message: String,
     },
+    Runtime {
+        provider: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for ProviderError {
@@ -491,6 +781,12 @@ impl fmt::Display for ProviderError {
                 formatter,
                 "provider {provider} has type {provider_type}, which cannot issue credentials yet"
             ),
+            Self::InvalidProviderConfig { provider, message } => {
+                write!(
+                    formatter,
+                    "provider {provider} config is invalid: {message}"
+                )
+            }
             Self::SecretKindMismatch {
                 provider,
                 actual,
@@ -514,6 +810,12 @@ impl fmt::Display for ProviderError {
                     "provider {provider} failed to read clock: {message}"
                 )
             }
+            Self::Runtime { provider, message } => {
+                write!(
+                    formatter,
+                    "provider {provider} failed to create runtime: {message}"
+                )
+            }
         }
     }
 }
@@ -528,9 +830,129 @@ mod tests {
     use heim_sources::ResolvedSecret;
 
     use super::{
+        AwsStsAssumeRoleRequest, AwsStsClient, AwsStsProvider, AwsStsSessionCredentials,
         CredentialProvider, CredentialRequest, GithubAppClient, GithubAppInstallationToken,
         GithubAppProvider, GithubPatProvider, ProviderError,
     };
+
+    #[test]
+    fn aws_sts_provider_assumes_role_and_exports_env_vars() {
+        let client = RecordingAwsStsClient::new(AwsStsSessionCredentials::new(
+            "ASIATEST",
+            "secret-access-key",
+            "session-token",
+        ));
+        let provider = AwsStsProvider::new(
+            "arn:aws:iam::123456789012:role/ProdReadonly",
+            Some("eu-west-1".to_owned()),
+            Some("15m".to_owned()),
+            Some("prod".to_owned()),
+            None,
+            Some("external-id".to_owned()),
+            client,
+        )
+        .expect("provider");
+        let request = CredentialRequest::new(
+            "aws.prod-readonly",
+            "aws_prod",
+            "claude-code",
+            ["aws", "sts", "get-caller-identity"],
+            PathBuf::from("/workspace"),
+        );
+
+        let credential = provider.issue(&request).expect("credential");
+
+        assert_eq!(credential.kind(), "aws_sts");
+        assert_eq!(credential.env_vars()[0].name(), "AWS_ACCESS_KEY_ID");
+        assert_eq!(credential.env_vars()[0].value(), "ASIATEST");
+        assert_eq!(credential.env_vars()[1].name(), "AWS_SECRET_ACCESS_KEY");
+        assert_eq!(credential.env_vars()[1].value(), "secret-access-key");
+        assert_eq!(credential.env_vars()[2].name(), "AWS_SESSION_TOKEN");
+        assert_eq!(credential.env_vars()[2].value(), "session-token");
+        assert_eq!(credential.env_vars()[3].name(), "AWS_REGION");
+        assert_eq!(credential.env_vars()[3].value(), "eu-west-1");
+        assert_eq!(credential.env_vars()[4].name(), "AWS_DEFAULT_REGION");
+        assert_eq!(credential.env_vars()[4].value(), "eu-west-1");
+        assert_eq!(
+            provider.client.calls.borrow().as_slice(),
+            [AwsStsAssumeRoleRequest {
+                role_arn: "arn:aws:iam::123456789012:role/ProdReadonly".to_owned(),
+                region: Some("eu-west-1".to_owned()),
+                duration_seconds: Some(900),
+                source_profile: Some("prod".to_owned()),
+                session_name: "heim-claude-code".to_owned(),
+                external_id: Some("external-id".to_owned()),
+            }]
+        );
+        assert!(!format!("{credential:?}").contains("secret-access-key"));
+        assert!(!format!("{credential:?}").contains("session-token"));
+    }
+
+    #[test]
+    fn aws_sts_provider_uses_configured_session_name() {
+        let client = RecordingAwsStsClient::new(AwsStsSessionCredentials::new(
+            "ASIATEST",
+            "secret-access-key",
+            "session-token",
+        ));
+        let provider = AwsStsProvider::new(
+            "arn:aws:iam::123456789012:role/ProdReadonly",
+            None,
+            Some("1h".to_owned()),
+            None,
+            Some("custom-session".to_owned()),
+            None,
+            client,
+        )
+        .expect("provider");
+        let request = CredentialRequest::new(
+            "aws.prod-readonly",
+            "aws_prod",
+            "codex",
+            ["aws", "sts", "get-caller-identity"],
+            PathBuf::from("/workspace"),
+        );
+
+        provider.issue(&request).expect("credential");
+
+        assert_eq!(
+            provider.client.calls.borrow()[0].session_name,
+            "custom-session"
+        );
+        assert_eq!(
+            provider.client.calls.borrow()[0].duration_seconds,
+            Some(3600)
+        );
+    }
+
+    #[test]
+    fn aws_sts_provider_rejects_invalid_duration() {
+        let error = AwsStsProvider::new(
+            "arn:aws:iam::123456789012:role/ProdReadonly",
+            None,
+            Some("soon".to_owned()),
+            None,
+            None,
+            None,
+            RecordingAwsStsClient::new(AwsStsSessionCredentials::new("a", "b", "c")),
+        )
+        .expect_err("invalid duration");
+
+        assert!(error.to_string().contains("duration soon is invalid"));
+    }
+
+    #[test]
+    fn aws_sts_session_credentials_debug_redacts_secret_values() {
+        let credentials =
+            AwsStsSessionCredentials::new("ASIATEST", "secret-access-key", "session-token");
+
+        let debug = format!("{credentials:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("ASIATEST"));
+        assert!(!debug.contains("secret-access-key"));
+        assert!(!debug.contains("session-token"));
+    }
 
     #[test]
     fn github_pat_provider_issues_gh_environment_variables() {
@@ -727,6 +1149,31 @@ mod tests {
             request.repositories,
             Some(vec!["backend".to_owned(), "worker".to_owned()])
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordingAwsStsClient {
+        credentials: AwsStsSessionCredentials,
+        calls: RefCell<Vec<AwsStsAssumeRoleRequest>>,
+    }
+
+    impl RecordingAwsStsClient {
+        fn new(credentials: AwsStsSessionCredentials) -> Self {
+            Self {
+                credentials,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AwsStsClient for RecordingAwsStsClient {
+        fn assume_role(
+            &self,
+            request: &AwsStsAssumeRoleRequest,
+        ) -> Result<AwsStsSessionCredentials, ProviderError> {
+            self.calls.borrow_mut().push(request.clone());
+            Ok(self.credentials.clone())
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,8 +7,9 @@ can also prepare JIT approval requests from configured transports, resolve a
 GitHub PAT from unsafe local auth, and inject it into allowed `heim exec` child
 processes. It can also resolve a GitHub App private key, mint a GitHub App
 installation token, and inject that token into allowed `heim exec` child
-processes. It can apply approval provider decisions, but does not call AWS,
-call Slack, or request approvals through a built-in transport yet.
+processes. It can issue AWS STS AssumeRole credentials for allowed commands
+through the AWS SDK credential chain. It can apply approval provider decisions,
+but does not call Slack or request approvals through a built-in transport yet.
 
 ## Config File
 
@@ -96,7 +97,8 @@ becomes `Approve 15m`.
 
 ## Providers
 
-`aws_sts` config describes a future AWS STS AssumeRole provider.
+`aws_sts` config describes an AWS STS AssumeRole provider. It uses the AWS SDK
+credential chain, optionally scoped to `source_profile`, to call STS.
 
 Required:
 
@@ -109,6 +111,9 @@ Optional:
 - `source_profile`
 - `session_name`
 - `external_id`
+
+`duration` accepts seconds or compact `s`, `m`, and `h` suffixes such as `900`,
+`15m`, or `1h`.
 
 `github_app` config describes a GitHub App installation token provider.
 
@@ -147,8 +152,8 @@ The unsafe local auth file is:
 
 This file stores secret values on disk. It is supported, but unsafe and should
 be avoided for sensitive use when a better source is available. Prefer AWS SSO
-or profiles for AWS, and prefer future OS keychain, 1Password, Vault, AWS
-Secrets Manager, or Infisical integrations when they are implemented.
+or AWS profiles, and prefer future OS keychain, 1Password, Vault, AWS Secrets
+Manager, or Infisical integrations when they are implemented.
 
 ```json
 {
@@ -204,10 +209,24 @@ These variables are scoped to the child process. If either variable already
 exists in the parent environment, Heim's issued value overrides it for the
 wrapped command only.
 
+The AWS STS provider assumes the configured role and injects:
+
+```text
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+AWS_SESSION_TOKEN
+```
+
+When `region` is configured, it also injects:
+
+```text
+AWS_REGION
+AWS_DEFAULT_REGION
+```
+
 The GitHub App provider signs a JWT with the configured private key, requests
 an installation token from GitHub, and injects that installation token. GitHub
-PAT remains a compatibility provider. AWS STS providers are configured and
-validated, but they cannot issue credentials yet.
+PAT remains a compatibility provider.
 
 Resolved secrets redact their values in `Debug` output. Error messages include
 auth entry names and secret types only, never secret values.

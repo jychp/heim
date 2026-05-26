@@ -186,9 +186,10 @@ heim exec --dir examples/policies aws.prod-readonly -- aws sts get-caller-identi
 When every requested grant is allowed directly by policy, Heim resolves the
 configured providers, injects supported credentials into the child process, and
 returns the command exit code. The current provider issuer supports
-`github_app` and `github_pat`, mapping the issued GitHub token to `GH_TOKEN`
-and `GITHUB_TOKEN`. AWS STS providers fail closed until their issuer
-implementation is added.
+`aws_sts`, `github_app`, and `github_pat`. AWS STS grants inject
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and
+configured region variables. GitHub grants map the issued token to `GH_TOKEN`
+and `GITHUB_TOKEN`.
 
 Injected variables override same-named parent environment variables for the
 wrapped command only.
