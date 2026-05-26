@@ -5,9 +5,10 @@ optional unsafe local auth entries. The current implementation validates
 config, provider, approval transport, and unsafe local auth file schemas. It
 can also prepare JIT approval requests from configured transports, resolve a
 GitHub PAT from unsafe local auth, and inject it into allowed `heim exec` child
+processes. It can also resolve a GitHub App private key, mint a GitHub App
+installation token, and inject that token into allowed `heim exec` child
 processes. It can apply approval provider decisions, but does not call AWS,
-call GitHub, mint GitHub App tokens, call Slack, or request approvals through a
-built-in transport yet.
+call Slack, or request approvals through a built-in transport yet.
 
 ## Config File
 
@@ -109,7 +110,7 @@ Optional:
 - `session_name`
 - `external_id`
 
-`github_app` config describes a future GitHub App installation token provider.
+`github_app` config describes a GitHub App installation token provider.
 
 Required:
 
@@ -120,6 +121,10 @@ Required:
 Optional:
 
 - `repositories`
+
+Repository values may be written as repository names or `owner/name` slugs.
+GitHub's installation token API receives repository names, so Heim strips the
+owner prefix when calling GitHub.
 
 `github_pat` config describes a GitHub PAT provider. PATs are supported for
 compatibility, but GitHub App installation tokens are preferred.
@@ -183,8 +188,9 @@ It can also resolve the local secrets required by one configured provider:
 GitHub App providers require a private key, GitHub PAT providers require a
 token, and AWS STS providers require no unsafe local auth secret.
 
-`heim exec` now uses this source boundary for `github_pat` providers when a
-grant is allowed directly by policy. The GitHub PAT provider injects:
+`heim exec` now uses this source boundary for `github_app` and `github_pat`
+providers when a grant is allowed directly by policy. The GitHub providers
+inject:
 
 ```text
 GH_TOKEN
@@ -195,8 +201,10 @@ These variables are scoped to the child process. If either variable already
 exists in the parent environment, Heim's issued value overrides it for the
 wrapped command only.
 
-GitHub App and AWS STS providers are configured and validated, but they cannot
-issue credentials yet.
+The GitHub App provider signs a JWT with the configured private key, requests
+an installation token from GitHub, and injects that installation token. GitHub
+PAT remains a compatibility provider. AWS STS providers are configured and
+validated, but they cannot issue credentials yet.
 
 Resolved secrets redact their values in `Debug` output. Error messages include
 auth entry names and secret types only, never secret values.

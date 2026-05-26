@@ -68,6 +68,7 @@ Forbidden values include:
 - AWS session tokens
 - GitHub tokens
 - GitHub App private keys
+- GitHub App installation tokens
 - personal access tokens
 
 This lets audit records explain what Heim issued without making audit storage a

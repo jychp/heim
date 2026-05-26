@@ -12,8 +12,8 @@ use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
 use heim_providers::{
-    CredentialEnvVar, CredentialProvider, CredentialRequest, GithubPatProvider, IssuedCredential,
-    ProviderGitContext,
+    CredentialEnvVar, CredentialProvider, CredentialRequest, GithubAppProvider, GithubPatProvider,
+    IssuedCredential, ProviderGitContext,
 };
 use heim_sources::{ProviderLocalSecrets, SecretSource, UnsafeLocalAuthSource};
 
@@ -962,13 +962,29 @@ fn issue_credentials_for_preflight(
                     },
                 ));
             }
-            heim_config::ProviderConfig::GithubApp(_) => {
-                return Err(ExecCredentialError::IssueCredential(
-                    heim_providers::ProviderError::UnsupportedProvider {
+            heim_config::ProviderConfig::GithubApp(provider_config) => {
+                let source = match &config_source.auth_file {
+                    Some(auth_file) => UnsafeLocalAuthSource::load_file(auth_file),
+                    None => UnsafeLocalAuthSource::load_default(),
+                }
+                .map_err(ExecCredentialError::ResolveSecret)?;
+                let ProviderLocalSecrets::GithubApp { private_key } = source
+                    .resolve_provider(provider)
+                    .map_err(ExecCredentialError::ResolveSecret)?
+                else {
+                    return Err(ExecCredentialError::ProviderSecretMismatch {
                         provider: grant.provider.to_string(),
-                        provider_type: "github_app",
-                    },
-                ));
+                    });
+                };
+                GithubAppProvider::from_secret_with_default_client(
+                    provider_config.app_id,
+                    provider_config.installation_id,
+                    provider_config.repositories.clone(),
+                    private_key,
+                )
+                .map_err(ExecCredentialError::IssueCredential)?
+                .issue(&request)
+                .map_err(ExecCredentialError::IssueCredential)?
             }
         };
 
