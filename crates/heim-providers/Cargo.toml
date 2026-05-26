@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 heim-sources = { version = "0.1.0", path = "../heim-sources" }
-jsonwebtoken = "9.3.1"
+jsonwebtoken = "10.3.0"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true }
 
