@@ -91,9 +91,9 @@ Provider configuration is loaded from the platform config directory:
 
 The config schema can model AWS STS, GitHub App, GitHub PAT providers, and
 approval transports such as Slack. Heim validates this schema and can issue a
-configured GitHub App installation token or GitHub PAT into an allowed child
-process. AWS STS credential issuance and built-in approval transport dispatch
-are not implemented yet.
+configured AWS STS session, GitHub App installation token, or GitHub PAT into
+an allowed child process. Built-in approval transport dispatch is not
+implemented yet.
 
 Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
 supported but should be avoided for sensitive use when better sources are
@@ -148,14 +148,17 @@ the `heim` binary. Policy evaluation returns `allow`, `deny`, or
 Heim loads provider configuration and issues supported local credentials before
 starting the wrapped command. The current issuer supports `github_app` and
 `github_pat`. Both inject `GH_TOKEN` and `GITHUB_TOKEN` into the child process.
+It also supports `aws_sts`, which assumes the configured role through the AWS
+SDK credential chain and injects `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and configured region variables.
 The `github_app` issuer signs a GitHub App JWT, requests an installation token
-from GitHub, and injects the token into those variables. AWS STS providers fail
-closed until their provider implementation is added. When approval is required,
-Heim loads config, validates the referenced approval transports, builds
+from GitHub, and injects the token into GitHub token variables. When approval is
+required, Heim loads config, validates the referenced approval transports, builds
 approval requests with configured options, and applies returned approval
 decisions. The default runtime still fails closed because no built-in approval
-transport dispatch is implemented yet. Heim does not contact AWS or Slack,
-request approvals through Slack, or issue AWS STS credentials yet.
+transport dispatch is implemented yet. Heim does not request approvals through
+Slack or issue provider credentials until policy and approval allow the
+command.
 
 Injected variables are scoped to the child process. If `GH_TOKEN` or
 `GITHUB_TOKEN` already exist in the parent environment, Heim's issued values
@@ -185,8 +188,8 @@ By default, audit writes target the platform config directory:
 Audit records must never contain credential secret values. `heim exec` emits one
 local audit event for the policy preflight decision and records redacted
 credential carrier metadata for issued GitHub App and GitHub PAT grants. It
-does not contact AWS, request approvals through Slack, or issue AWS STS
-credentials yet.
+also records redacted metadata for issued AWS STS grants. It does not request
+approvals through Slack yet.
 
 Local audit events can be listed with:
 

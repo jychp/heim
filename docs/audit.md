@@ -59,7 +59,7 @@ Audit events must never contain credential secret values.
 
 Allowed credential metadata includes:
 
-- provider or credential kind, such as `aws-sts` or `github-app`
+- provider or credential kind, such as `aws_sts` or `github_app`
 - environment variable names that received credentials
 - temporary file labels or paths when temporary files are created later
 - issuance and expiration timestamps

@@ -12,8 +12,8 @@ use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
 use heim_policy::{DenyReason, PolicyDecision, PolicyRequest, evaluate_policy};
 use heim_providers::{
-    CredentialEnvVar, CredentialProvider, CredentialRequest, GithubAppProvider, GithubPatProvider,
-    IssuedCredential, ProviderGitContext,
+    AwsStsProvider, CredentialEnvVar, CredentialProvider, CredentialRequest, GithubAppProvider,
+    GithubPatProvider, IssuedCredential, ProviderGitContext,
 };
 use heim_sources::{ProviderLocalSecrets, SecretSource, UnsafeLocalAuthSource};
 
@@ -988,13 +988,18 @@ fn issue_credentials_for_preflight(
                     .issue(&request)
                     .map_err(ExecCredentialError::IssueCredential)?
             }
-            heim_config::ProviderConfig::AwsSts(_) => {
-                return Err(ExecCredentialError::IssueCredential(
-                    heim_providers::ProviderError::UnsupportedProvider {
-                        provider: grant.provider.to_string(),
-                        provider_type: "aws_sts",
-                    },
-                ));
+            heim_config::ProviderConfig::AwsSts(provider_config) => {
+                AwsStsProvider::with_default_client(
+                    provider_config.role_arn.clone(),
+                    provider_config.region.clone(),
+                    provider_config.duration.clone(),
+                    provider_config.source_profile.clone(),
+                    provider_config.session_name.clone(),
+                    provider_config.external_id.clone(),
+                )
+                .map_err(ExecCredentialError::IssueCredential)?
+                .issue(&request)
+                .map_err(ExecCredentialError::IssueCredential)?
             }
             heim_config::ProviderConfig::GithubApp(provider_config) => {
                 let source = match &config_source.auth_file {
@@ -2235,8 +2240,16 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
     }
 
     #[test]
-    fn exec_fails_closed_for_allowed_provider_without_issuer() {
-        let config = format!("{}/../../examples/config.toml", env!("CARGO_MANIFEST_DIR"));
+    fn exec_fails_closed_for_invalid_aws_sts_config() {
+        let config = TestFile::new(
+            "config",
+            r#"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+duration = "soon"
+"#,
+        );
         let policy = TestFile::new(
             "policy",
             r#"
@@ -2255,7 +2268,7 @@ approval = "grant"
                 "--file",
                 policy.path().to_str().expect("utf-8 path"),
                 "--config-file",
-                &config,
+                config.path().to_str().expect("utf-8 path"),
                 "aws.prod-readonly",
                 "--",
                 "aws",
@@ -2274,7 +2287,7 @@ approval = "grant"
         assert!(
             result
                 .stderr
-                .contains("provider aws_prod has type aws_sts, which cannot issue credentials yet")
+                .contains("provider aws_sts config is invalid: duration soon is invalid")
         );
     }
 
