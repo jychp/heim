@@ -1,7 +1,7 @@
 //! Credential providers for Heim.
 //!
 //! This crate converts resolved secret material into process-scoped credential
-//! carriers. It does not call AWS APIs yet.
+//! carriers.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_config::BehaviorVersion;
 use heim_sources::ResolvedSecret;
 use serde::{Deserialize, Serialize};
+
+const AWS_STS_MIN_DURATION_SECONDS: i32 = 900;
+const AWS_STS_MAX_DURATION_SECONDS: i32 = 43_200;
 
 /// Request context passed to a credential provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,10 +419,14 @@ fn parse_aws_duration_seconds(value: &str) -> Result<i32, ProviderError> {
 
     number
         .checked_mul(multiplier)
-        .filter(|duration| *duration > 0)
+        .filter(|duration| {
+            (AWS_STS_MIN_DURATION_SECONDS..=AWS_STS_MAX_DURATION_SECONDS).contains(duration)
+        })
         .ok_or_else(|| ProviderError::InvalidProviderConfig {
             provider: "aws_sts",
-            message: format!("duration {value} is invalid"),
+            message: format!(
+                "duration {value} must be between {AWS_STS_MIN_DURATION_SECONDS} and {AWS_STS_MAX_DURATION_SECONDS} seconds"
+            ),
         })
 }
 
@@ -939,6 +946,46 @@ mod tests {
         .expect_err("invalid duration");
 
         assert!(error.to_string().contains("duration soon is invalid"));
+    }
+
+    #[test]
+    fn aws_sts_provider_rejects_duration_below_aws_minimum() {
+        let error = AwsStsProvider::new(
+            "arn:aws:iam::123456789012:role/ProdReadonly",
+            None,
+            Some("14m".to_owned()),
+            None,
+            None,
+            None,
+            RecordingAwsStsClient::new(AwsStsSessionCredentials::new("a", "b", "c")),
+        )
+        .expect_err("duration below AWS minimum");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duration 14m must be between 900 and 43200 seconds")
+        );
+    }
+
+    #[test]
+    fn aws_sts_provider_rejects_duration_above_aws_maximum() {
+        let error = AwsStsProvider::new(
+            "arn:aws:iam::123456789012:role/ProdReadonly",
+            None,
+            Some("13h".to_owned()),
+            None,
+            None,
+            None,
+            RecordingAwsStsClient::new(AwsStsSessionCredentials::new("a", "b", "c")),
+        )
+        .expect_err("duration above AWS maximum");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duration 13h must be between 900 and 43200 seconds")
+        );
     }
 
     #[test]

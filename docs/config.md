@@ -113,7 +113,8 @@ Optional:
 - `external_id`
 
 `duration` accepts seconds or compact `s`, `m`, and `h` suffixes such as `900`,
-`15m`, or `1h`.
+`15m`, or `1h`. Values must fit the AWS STS AssumeRole range of 900 to 43200
+seconds.
 
 `github_app` config describes a GitHub App installation token provider.
 

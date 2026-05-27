@@ -58,3 +58,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Allowed additional permissive dependency licenses required by the GitHub App
   provider HTTP, TLS, and JWT stack.
 - Added the official AWS SDK crates required by the AWS STS provider.
+
+### Fixed
+
+- Validate AWS STS AssumeRole durations against AWS API bounds before issuing
+  provider requests.
