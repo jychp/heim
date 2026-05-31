@@ -6,5 +6,9 @@
   "github_personal_pat": {
     "type": "github_pat",
     "token": "redacted"
+  },
+  "slack_bot_token": {
+    "type": "slack_bot_token",
+    "token": "xoxb-redacted"
   }
 }

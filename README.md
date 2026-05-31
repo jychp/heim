@@ -69,8 +69,8 @@ Grant policies can express:
 Policy evaluation can drive local preflight and allowed command execution.
 When JIT approval is required, Heim prepares transport-neutral approval
 requests from the execution context and config. It can apply approval decisions
-returned by an approval provider, but built-in Slack dispatch is not implemented
-yet.
+returned by an approval provider. The built-in Slack provider validates runtime
+config and secrets, but Slack API dispatch is not implemented yet.
 
 Policy files are loaded from the platform config directory by default:
 
@@ -92,8 +92,7 @@ Provider configuration is loaded from the platform config directory:
 The config schema can model AWS STS, GitHub App, GitHub PAT providers, and
 approval transports such as Slack. Heim validates this schema and can issue a
 configured AWS STS session, GitHub App installation token, or GitHub PAT into
-an allowed child process. Built-in approval transport dispatch is not
-implemented yet.
+an allowed child process. Built-in Slack API dispatch is not implemented yet.
 
 Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
 supported but should be avoided for sensitive use when better sources are
@@ -156,9 +155,8 @@ from GitHub, and injects the token into GitHub token variables. When approval is
 required, Heim loads config, validates the referenced approval transports, builds
 approval requests with configured options, and applies returned approval
 decisions. The default runtime still fails closed because no built-in approval
-transport dispatch is implemented yet. Heim does not request approvals through
-Slack or issue provider credentials until policy and approval allow the
-command.
+transport calls Slack yet. Heim does not issue provider credentials until policy
+and approval allow the command.
 
 Injected variables are scoped to the child process. If `GH_TOKEN` or
 `GITHUB_TOKEN` already exist in the parent environment, Heim's issued values
@@ -189,7 +187,7 @@ Audit records must never contain credential secret values. `heim exec` emits one
 local audit event for the policy preflight decision and records redacted
 credential carrier metadata for issued GitHub App and GitHub PAT grants. It
 also records redacted metadata for issued AWS STS grants. It does not request
-approvals through Slack yet.
+approvals through the Slack API yet.
 
 Local audit events can be listed with:
 
