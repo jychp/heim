@@ -299,6 +299,154 @@ pub trait ApprovalProvider {
     ) -> Result<ApprovalDecision, ApprovalError>;
 }
 
+/// Redacted Slack bot token used by Slack approval transports.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SlackBotToken(String);
+
+impl SlackBotToken {
+    pub fn new(token: impl Into<String>) -> Result<Self, SlackApprovalConfigError> {
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(SlackApprovalConfigError::MissingBotToken);
+        }
+
+        Ok(Self(token))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SlackBotToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SlackBotToken")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
+/// Config error for a Slack approval provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackApprovalConfigError {
+    MissingChannel,
+    MissingBotToken,
+}
+
+impl fmt::Display for SlackApprovalConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingChannel => formatter.write_str("slack approval channel is required"),
+            Self::MissingBotToken => formatter.write_str("slack bot token is required"),
+        }
+    }
+}
+
+impl std::error::Error for SlackApprovalConfigError {}
+
+/// Slack approval provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackApprovalProvider<C = UnavailableSlackApprovalClient> {
+    transport: ApprovalTransportName,
+    channel: String,
+    bot_token: SlackBotToken,
+    client: C,
+}
+
+impl<C> SlackApprovalProvider<C> {
+    pub fn new(
+        transport: ApprovalTransportName,
+        channel: impl Into<String>,
+        bot_token: SlackBotToken,
+        client: C,
+    ) -> Result<Self, SlackApprovalConfigError> {
+        let channel = channel.into();
+        if channel.trim().is_empty() {
+            return Err(SlackApprovalConfigError::MissingChannel);
+        }
+
+        Ok(Self {
+            transport,
+            channel,
+            bot_token,
+            client,
+        })
+    }
+
+    pub fn transport_name(&self) -> &ApprovalTransportName {
+        &self.transport
+    }
+}
+
+impl SlackApprovalProvider {
+    pub fn with_default_client(
+        transport: ApprovalTransportName,
+        channel: impl Into<String>,
+        bot_token: SlackBotToken,
+    ) -> Result<Self, SlackApprovalConfigError> {
+        Self::new(
+            transport,
+            channel,
+            bot_token,
+            UnavailableSlackApprovalClient,
+        )
+    }
+}
+
+impl<C> ApprovalProvider for SlackApprovalProvider<C>
+where
+    C: SlackApprovalClient,
+{
+    fn request_approval(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        if request.transport != self.transport {
+            return Err(ApprovalError::RequestRejected {
+                transport: request.transport.clone(),
+                message: format!(
+                    "request targets transport {}, but provider is configured for {}",
+                    request.transport, self.transport
+                ),
+            });
+        }
+
+        self.client
+            .request_slack_approval(&self.transport, &self.channel, &self.bot_token, request)
+    }
+}
+
+/// Client boundary used by Slack approval providers.
+pub trait SlackApprovalClient {
+    fn request_slack_approval(
+        &self,
+        transport: &ApprovalTransportName,
+        channel: &str,
+        bot_token: &SlackBotToken,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError>;
+}
+
+/// Placeholder Slack client used until the real Slack API flow is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnavailableSlackApprovalClient;
+
+impl SlackApprovalClient for UnavailableSlackApprovalClient {
+    fn request_slack_approval(
+        &self,
+        transport: &ApprovalTransportName,
+        _channel: &str,
+        _bot_token: &SlackBotToken,
+        _request: &ApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Err(ApprovalError::TransportUnavailable {
+            transport: transport.clone(),
+            message: "Slack approval dispatch is not implemented yet".to_owned(),
+        })
+    }
+}
+
 /// Error returned by an approval transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalError {
@@ -341,6 +489,7 @@ mod tests {
     use super::{
         ApprovalDecision, ApprovalError, ApprovalGitContext, ApprovalGrant, ApprovalGrantDecision,
         ApprovalOption, ApprovalProvider, ApprovalRequest, ApprovalTransportName,
+        SlackApprovalClient, SlackApprovalConfigError, SlackApprovalProvider, SlackBotToken,
     };
 
     #[test]
@@ -499,6 +648,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slack_bot_token_debug_redacts_secret_value() {
+        let token = SlackBotToken::new("xoxb-secret").expect("token");
+
+        let debug = format!("{token:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("xoxb-secret"));
+    }
+
+    #[test]
+    fn slack_provider_rejects_empty_channel() {
+        let error = SlackApprovalProvider::new(
+            ApprovalTransportName::new("slack").expect("valid transport"),
+            "",
+            SlackBotToken::new("xoxb-secret").expect("token"),
+            RecordingSlackClient::new(ApprovalDecision::TimedOut),
+        )
+        .expect_err("missing channel");
+
+        assert_eq!(error, SlackApprovalConfigError::MissingChannel);
+    }
+
+    #[test]
+    fn slack_provider_delegates_requests_to_client() {
+        let client = RecordingSlackClient::new(ApprovalDecision::Approved(
+            ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+        ));
+        let provider = SlackApprovalProvider::new(
+            ApprovalTransportName::new("slack").expect("valid transport"),
+            "#heim-approvals",
+            SlackBotToken::new("xoxb-secret").expect("token"),
+            client,
+        )
+        .expect("provider");
+        let request = ApprovalRequest::new(
+            "request-1",
+            ApprovalTransportName::new("slack").expect("valid transport"),
+            "codex",
+            ["aws", "s3", "ls"],
+            PathBuf::from("/workspace"),
+        );
+
+        let decision = provider.request_approval(&request).expect("decision");
+
+        assert!(decision.is_approved());
+        assert_eq!(
+            provider.client.seen.borrow().as_slice(),
+            [(
+                "slack".to_owned(),
+                "#heim-approvals".to_owned(),
+                "xoxb-secret".to_owned(),
+                "request-1".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
+    fn slack_provider_rejects_wrong_transport_request() {
+        let provider = SlackApprovalProvider::new(
+            ApprovalTransportName::new("slack").expect("valid transport"),
+            "#heim-approvals",
+            SlackBotToken::new("xoxb-secret").expect("token"),
+            RecordingSlackClient::new(ApprovalDecision::TimedOut),
+        )
+        .expect("provider");
+        let request = ApprovalRequest::new(
+            "request-1",
+            ApprovalTransportName::new("ticket").expect("valid transport"),
+            "codex",
+            ["aws", "s3", "ls"],
+            PathBuf::from("/workspace"),
+        );
+
+        let error = provider
+            .request_approval(&request)
+            .expect_err("wrong transport");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider is configured for slack")
+        );
+    }
+
     struct RecordingApprovalProvider {
         decision: ApprovalDecision,
         request_ids: RefCell<Vec<String>>,
@@ -521,6 +755,39 @@ mod tests {
             self.request_ids
                 .borrow_mut()
                 .push(request.request_id.clone());
+            Ok(self.decision.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingSlackClient {
+        decision: ApprovalDecision,
+        seen: RefCell<Vec<(String, String, String, String)>>,
+    }
+
+    impl RecordingSlackClient {
+        fn new(decision: ApprovalDecision) -> Self {
+            Self {
+                decision,
+                seen: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SlackApprovalClient for RecordingSlackClient {
+        fn request_slack_approval(
+            &self,
+            transport: &ApprovalTransportName,
+            channel: &str,
+            bot_token: &SlackBotToken,
+            request: &ApprovalRequest,
+        ) -> Result<ApprovalDecision, ApprovalError> {
+            self.seen.borrow_mut().push((
+                transport.to_string(),
+                channel.to_owned(),
+                bot_token.as_str().to_owned(),
+                request.request_id.clone(),
+            ));
             Ok(self.decision.clone())
         }
     }

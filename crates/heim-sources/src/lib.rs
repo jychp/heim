@@ -14,6 +14,7 @@ use heim_config::{LocalAuthFile, LocalAuthRef, LocalAuthSecret, ProviderConfig};
 pub enum SecretKind {
     GithubAppPrivateKey,
     GithubPat,
+    SlackBotToken,
 }
 
 impl fmt::Display for SecretKind {
@@ -21,6 +22,7 @@ impl fmt::Display for SecretKind {
         match self {
             Self::GithubAppPrivateKey => formatter.write_str("github_app_private_key"),
             Self::GithubPat => formatter.write_str("github_pat"),
+            Self::SlackBotToken => formatter.write_str("slack_bot_token"),
         }
     }
 }
@@ -30,6 +32,7 @@ impl fmt::Display for SecretKind {
 pub enum ResolvedSecret {
     GithubAppPrivateKey { pem: String },
     GithubPat { token: String },
+    SlackBotToken { token: String },
 }
 
 impl ResolvedSecret {
@@ -37,6 +40,13 @@ impl ResolvedSecret {
         match self {
             Self::GithubAppPrivateKey { .. } => SecretKind::GithubAppPrivateKey,
             Self::GithubPat { .. } => SecretKind::GithubPat,
+            Self::SlackBotToken { .. } => SecretKind::SlackBotToken,
+        }
+    }
+
+    pub fn slack_bot_token(token: impl Into<String>) -> Self {
+        Self::SlackBotToken {
+            token: token.into(),
         }
     }
 }
@@ -50,6 +60,10 @@ impl fmt::Debug for ResolvedSecret {
                 .finish(),
             Self::GithubPat { .. } => formatter
                 .debug_struct("GithubPat")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::SlackBotToken { .. } => formatter
+                .debug_struct("SlackBotToken")
                 .field("token", &"<redacted>")
                 .finish(),
         }
@@ -144,6 +158,9 @@ impl SecretSource for UnsafeLocalAuthSource {
                 ResolvedSecret::GithubAppPrivateKey { pem: pem.clone() }
             }
             LocalAuthSecret::GithubPat { token } => ResolvedSecret::GithubPat {
+                token: token.clone(),
+            },
+            LocalAuthSecret::SlackBotToken { token } => ResolvedSecret::SlackBotToken {
                 token: token.clone(),
             },
         };
@@ -256,6 +273,46 @@ mod tests {
             .expect("resolved secret");
 
         assert_eq!(secret.kind(), SecretKind::GithubAppPrivateKey);
+    }
+
+    #[test]
+    fn resolves_slack_bot_token_from_unsafe_local_auth() {
+        let source = source_from_json(
+            r#"{
+                "slack_bot_token": {
+                    "type": "slack_bot_token",
+                    "token": "xoxb-secret"
+                }
+            }"#,
+        );
+        let auth_ref = LocalAuthRef::new("slack_bot_token").expect("valid auth ref");
+
+        let secret = source
+            .resolve(&auth_ref, SecretKind::SlackBotToken)
+            .expect("resolved secret");
+
+        assert_eq!(secret.kind(), SecretKind::SlackBotToken);
+        assert!(!format!("{secret:?}").contains("xoxb-secret"));
+    }
+
+    #[test]
+    fn rejects_slack_secret_when_github_pat_expected() {
+        let source = source_from_json(
+            r#"{
+                "slack_bot_token": {
+                    "type": "slack_bot_token",
+                    "token": "xoxb-secret"
+                }
+            }"#,
+        );
+        let auth_ref = LocalAuthRef::new("slack_bot_token").expect("valid auth ref");
+
+        let error = source
+            .resolve(&auth_ref, SecretKind::GithubPat)
+            .expect_err("wrong secret kind");
+
+        assert!(error.to_string().contains("expected github_pat"));
+        assert!(!error.to_string().contains("xoxb-secret"));
     }
 
     #[test]

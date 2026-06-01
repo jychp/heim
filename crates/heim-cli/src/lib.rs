@@ -6,7 +6,7 @@ use std::{ffi::OsStr, fmt};
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use heim_approvals::{
     ApprovalDecision, ApprovalError, ApprovalGitContext, ApprovalGrant, ApprovalProvider,
-    ApprovalRequest,
+    ApprovalRequest, SlackApprovalProvider, SlackBotToken,
 };
 use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
@@ -15,7 +15,7 @@ use heim_providers::{
     AwsStsProvider, CredentialEnvVar, CredentialProvider, CredentialRequest, GithubAppProvider,
     GithubPatProvider, IssuedCredential, ProviderGitContext,
 };
-use heim_sources::{ProviderLocalSecrets, SecretSource, UnsafeLocalAuthSource};
+use heim_sources::{ProviderLocalSecrets, SecretKind, SecretSource, UnsafeLocalAuthSource};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
 const POLICY_DENIED_EXIT_CODE: i32 = 3;
@@ -159,11 +159,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    run_from_with_context(
+    run_from_with_context_runtime(
         args,
         infer_requester_from_parent_process,
         default_audit_context,
-        UnsupportedApprovalProvider,
+        ApprovalRuntime::built_in(),
         append_default_audit_event,
         execute_command,
     )
@@ -186,6 +186,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn run_from_with_context<I, T, F, C, A>(
     args: I,
     infer_requester: F,
@@ -201,21 +202,21 @@ where
     C: FnOnce() -> AuditContext,
     A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
 {
-    run_from_with_context_and_approvals(
+    run_from_with_context_runtime(
         args,
         infer_requester,
         audit_context,
-        approval_provider,
+        ApprovalRuntime::Injected(&approval_provider),
         append_audit_event,
         execute_command,
     )
 }
 
-fn run_from_with_context_and_approvals<I, T, F, C, A, P>(
+fn run_from_with_context_runtime<I, T, F, C, A>(
     args: I,
     infer_requester: F,
     audit_context: C,
-    approval_provider: P,
+    approval_runtime: ApprovalRuntime<'_>,
     append_audit_event: A,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
@@ -225,14 +226,13 @@ where
     F: FnOnce() -> Result<String, RequesterInferenceError>,
     C: FnOnce() -> AuditContext,
     A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
-    P: ApprovalProvider,
 {
     match Cli::try_parse_from(args) {
         Ok(cli) => run(
             cli,
             infer_requester,
             audit_context,
-            approval_provider,
+            approval_runtime,
             append_audit_event,
             execute_command,
         ),
@@ -258,11 +258,38 @@ where
     }
 }
 
+#[cfg(test)]
+fn run_from_with_context_and_approvals<I, T, F, C, A, P>(
+    args: I,
+    infer_requester: F,
+    audit_context: C,
+    approval_provider: P,
+    append_audit_event: A,
+    execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
+) -> CommandResult
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+    F: FnOnce() -> Result<String, RequesterInferenceError>,
+    C: FnOnce() -> AuditContext,
+    A: FnOnce(&heim_audit::AuditEvent) -> Result<(), heim_audit::AuditLogError>,
+    P: ApprovalProvider,
+{
+    run_from_with_context(
+        args,
+        infer_requester,
+        audit_context,
+        approval_provider,
+        append_audit_event,
+        execute_command,
+    )
+}
+
 fn run<F, C, A>(
     cli: Cli,
     infer_requester: F,
     audit_context: C,
-    approval_provider: impl ApprovalProvider,
+    approval_runtime: ApprovalRuntime<'_>,
     append_audit_event: A,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
@@ -292,7 +319,7 @@ where
             },
             infer_requester,
             audit_context,
-            approval_provider,
+            approval_runtime,
             append_audit_event,
             execute_command,
         ),
@@ -324,7 +351,7 @@ fn run_exec<F, C, A>(
     cli_request: ExecCliRequest,
     infer_requester: F,
     audit_context: C,
-    approval_provider: impl ApprovalProvider,
+    approval_runtime: ApprovalRuntime<'_>,
     append_audit_event: A,
     execute_command: impl FnOnce(&[String], &[CredentialEnvVar]) -> CommandResult,
 ) -> CommandResult
@@ -407,7 +434,11 @@ where
             };
         }
 
-        if let Err(error) = apply_approval_requests(&approval_provider, &approval_requests) {
+        if let Err(error) = apply_approval_requests(
+            approval_runtime,
+            &cli_request.config_source,
+            &approval_requests,
+        ) {
             return CommandResult {
                 code: APPROVAL_ERROR_EXIT_CODE,
                 stdout: String::new(),
@@ -882,8 +913,10 @@ fn execute_command(command: &[String], env_vars: &[CredentialEnvVar]) -> Command
     }
 }
 
+#[cfg(test)]
 struct UnsupportedApprovalProvider;
 
+#[cfg(test)]
 impl ApprovalProvider for UnsupportedApprovalProvider {
     fn request_approval(
         &self,
@@ -896,8 +929,38 @@ impl ApprovalProvider for UnsupportedApprovalProvider {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ApprovalRuntime<'a> {
+    BuiltIn(std::marker::PhantomData<&'a ()>),
+    #[cfg(test)]
+    Injected(&'a dyn ApprovalProvider),
+}
+
+impl<'a> ApprovalRuntime<'a> {
+    fn built_in() -> Self {
+        Self::BuiltIn(std::marker::PhantomData)
+    }
+}
+
 fn apply_approval_requests(
-    provider: &impl ApprovalProvider,
+    runtime: ApprovalRuntime<'_>,
+    config_source: &ConfigSource,
+    requests: &[ApprovalRequest],
+) -> Result<(), ExecApprovalError> {
+    match runtime {
+        ApprovalRuntime::BuiltIn(_) => {
+            let provider = RuntimeApprovalProvider::from_config_source(config_source, requests)?;
+            apply_approval_requests_with_provider(&provider, requests)
+        }
+        #[cfg(test)]
+        ApprovalRuntime::Injected(provider) => {
+            apply_approval_requests_with_provider(provider, requests)
+        }
+    }
+}
+
+fn apply_approval_requests_with_provider(
+    provider: &dyn ApprovalProvider,
     requests: &[ApprovalRequest],
 ) -> Result<(), ExecApprovalError> {
     for request in requests {
@@ -908,6 +971,104 @@ fn apply_approval_requests(
     }
 
     Ok(())
+}
+
+struct RuntimeApprovalProvider {
+    transports: Vec<RuntimeApprovalTransport>,
+}
+
+impl RuntimeApprovalProvider {
+    fn from_config_source(
+        config_source: &ConfigSource,
+        requests: &[ApprovalRequest],
+    ) -> Result<Self, ExecApprovalError> {
+        let config = load_config_source(config_source).map_err(ExecApprovalError::LoadConfig)?;
+        let source = match &config_source.auth_file {
+            Some(auth_file) => UnsafeLocalAuthSource::load_file(auth_file),
+            None => UnsafeLocalAuthSource::load_default(),
+        }
+        .map_err(ExecApprovalError::ResolveSecret)?;
+        let transports = config
+            .approval_transports
+            .into_iter()
+            .filter(|transport| {
+                requests
+                    .iter()
+                    .any(|request| request.transport.as_str() == transport.name.as_str())
+            })
+            .map(|transport| RuntimeApprovalTransport::from_config(transport, &source))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self { transports })
+    }
+}
+
+impl ApprovalProvider for RuntimeApprovalProvider {
+    fn request_approval(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let Some(transport) = self
+            .transports
+            .iter()
+            .find(|transport| transport.name() == request.transport.as_str())
+        else {
+            return Err(ApprovalError::TransportUnavailable {
+                transport: request.transport.clone(),
+                message: "approval transport is not configured".to_owned(),
+            });
+        };
+
+        transport.request_approval(request)
+    }
+}
+
+enum RuntimeApprovalTransport {
+    Slack(SlackApprovalProvider),
+}
+
+impl RuntimeApprovalTransport {
+    fn from_config(
+        transport: heim_config::ApprovalTransportConfig,
+        source: &UnsafeLocalAuthSource,
+    ) -> Result<Self, ExecApprovalError> {
+        match transport.kind {
+            heim_config::ApprovalTransportKind::Slack { channel, bot_token } => {
+                let secret = source
+                    .resolve(&bot_token, SecretKind::SlackBotToken)
+                    .map_err(ExecApprovalError::ResolveSecret)?;
+                let heim_sources::ResolvedSecret::SlackBotToken { token } = secret else {
+                    return Err(ExecApprovalError::TransportSecretMismatch {
+                        transport: transport.name.to_string(),
+                    });
+                };
+                let bot_token =
+                    SlackBotToken::new(token).map_err(ExecApprovalError::SlackConfig)?;
+                let provider =
+                    SlackApprovalProvider::with_default_client(transport.name, channel, bot_token)
+                        .map_err(ExecApprovalError::SlackConfig)?;
+
+                Ok(Self::Slack(provider))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Slack(provider) => provider.transport_name().as_str(),
+        }
+    }
+}
+
+impl ApprovalProvider for RuntimeApprovalTransport {
+    fn request_approval(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        match self {
+            Self::Slack(provider) => provider.request_approval(request),
+        }
+    }
 }
 
 fn validate_approval_decision(
@@ -1138,11 +1299,14 @@ fn approval_grants_for_transport(
 #[derive(Debug)]
 enum ExecApprovalError {
     LoadConfig(heim_config::ConfigError),
+    ResolveSecret(heim_sources::SecretSourceError),
     BuildRequest(heim_approvals::ApprovalRequestBuildError),
     ApprovalProvider(heim_approvals::ApprovalError),
+    SlackConfig(heim_approvals::SlackApprovalConfigError),
     MissingGrant { grant: String },
     MissingProviderConfig { grant: String, provider: String },
     MissingApprovalTransport { transport: String },
+    TransportSecretMismatch { transport: String },
     ApprovalDenied { transport: String },
     ApprovalTimedOut { transport: String },
     UnconfiguredApprovalOption { transport: String, option: String },
@@ -1152,8 +1316,10 @@ impl fmt::Display for ExecApprovalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LoadConfig(source) => write!(formatter, "{source}"),
+            Self::ResolveSecret(source) => write!(formatter, "{source}"),
             Self::BuildRequest(source) => write!(formatter, "{source}"),
             Self::ApprovalProvider(source) => write!(formatter, "{source}"),
+            Self::SlackConfig(source) => write!(formatter, "{source}"),
             Self::MissingGrant { grant } => {
                 write!(
                     formatter,
@@ -1167,6 +1333,10 @@ impl fmt::Display for ExecApprovalError {
             Self::MissingApprovalTransport { transport } => write!(
                 formatter,
                 "approval transport {transport} is required by policy but is not configured"
+            ),
+            Self::TransportSecretMismatch { transport } => write!(
+                formatter,
+                "approval transport {transport} resolved an unexpected local secret"
             ),
             Self::ApprovalDenied { transport } => {
                 write!(formatter, "approval request was denied by {transport}")
@@ -1186,11 +1356,14 @@ impl std::error::Error for ExecApprovalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LoadConfig(source) => Some(source),
+            Self::ResolveSecret(source) => Some(source),
             Self::BuildRequest(source) => Some(source),
             Self::ApprovalProvider(source) => Some(source),
+            Self::SlackConfig(source) => Some(source),
             Self::MissingGrant { .. }
             | Self::MissingProviderConfig { .. }
             | Self::MissingApprovalTransport { .. }
+            | Self::TransportSecretMismatch { .. }
             | Self::ApprovalDenied { .. }
             | Self::ApprovalTimedOut { .. }
             | Self::UnconfiguredApprovalOption { .. } => None,
@@ -1955,6 +2128,7 @@ private_key = { auth = "github_drymn_app_private_key" }
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
 options = ["15m", "60m"]
 "##,
         );
@@ -2199,6 +2373,132 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
             result
                 .stderr
                 .contains("approval request timed out on slack")
+        );
+    }
+
+    #[test]
+    fn exec_runtime_dispatches_jit_requests_to_configured_slack_transport() {
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "github.personal-readonly"
+provider = "github_personal"
+allow = ["gh"]
+commands = ["gh pr view *"]
+approval = "jit:slack"
+"#,
+        );
+        let config = TestFile::new(
+            "config",
+            r##"
+[providers.github_personal]
+type = "github_pat"
+token = { auth = "github_personal_pat" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
+options = ["15m", "60m"]
+"##,
+        );
+        let auth = TestFile::unsafe_auth_file();
+        let result = super::run_from_with_context_runtime(
+            [
+                "heim",
+                "exec",
+                "--file",
+                policy.path().to_str().expect("utf-8 path"),
+                "--config-file",
+                config.path().to_str().expect("utf-8 path"),
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Ok("gh".to_owned()),
+            super::test_audit_context,
+            super::ApprovalRuntime::built_in(),
+            |_| Ok(()),
+            |_, _| panic!("command should not execute without Slack approval dispatch"),
+        );
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval transport slack is unavailable")
+        );
+        assert!(
+            result
+                .stderr
+                .contains("Slack approval dispatch is not implemented yet")
+        );
+    }
+
+    #[test]
+    fn exec_runtime_fails_closed_when_slack_token_is_missing() {
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "github.personal-readonly"
+provider = "github_personal"
+allow = ["gh"]
+commands = ["gh pr view *"]
+approval = "jit:slack"
+"#,
+        );
+        let config = TestFile::new(
+            "config",
+            r##"
+[providers.github_personal]
+type = "github_pat"
+token = { auth = "github_personal_pat" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+bot_token = { auth = "missing_slack_bot_token" }
+"##,
+        );
+        let auth = TestFile::unsafe_auth_file();
+        let result = super::run_from_with_context_runtime(
+            [
+                "heim",
+                "exec",
+                "--file",
+                policy.path().to_str().expect("utf-8 path"),
+                "--config-file",
+                config.path().to_str().expect("utf-8 path"),
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Ok("gh".to_owned()),
+            super::test_audit_context,
+            super::ApprovalRuntime::built_in(),
+            |_| Ok(()),
+            |_, _| panic!("command should not execute without Slack token"),
+        );
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("unsafe local auth entry missing_slack_bot_token was not found")
         );
     }
 
@@ -2583,6 +2883,7 @@ token = { auth = "github_personal_pat" }
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
 options = ["15m", "60m"]
 "##,
         );
@@ -2670,6 +2971,10 @@ options = ["15m", "60m"]
                     "github_personal_pat": {
                         "type": "github_pat",
                         "token": "ghp_secret"
+                    },
+                    "slack_bot_token": {
+                        "type": "slack_bot_token",
+                        "token": "xoxb_secret"
                     }
                 }"#,
             );

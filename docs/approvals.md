@@ -37,6 +37,7 @@ integration. `config.toml` uses the compact form:
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
 options = ["15m", "60m"]
 ```
 
@@ -95,14 +96,31 @@ The transport itself lives in `config.toml`:
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
 options = ["15m", "60m"]
 ```
 
 Slack is the first planned v0 transport. The contract intentionally does not
 encode Slack-only fields in the common request or decision types.
 
+Slack secrets live in `.auth.json`, not `config.toml`:
+
+```json
+{
+  "slack_bot_token": {
+    "type": "slack_bot_token",
+    "token": "xoxb-redacted"
+  }
+}
+```
+
+`heim exec` now dispatches JIT approval requests through the configured
+transport boundary. The built-in Slack provider validates the configured
+channel and bot token reference, then fails closed until the Slack API flow is
+implemented.
+
 ## Current Limitations
 
 `heim exec` still fails closed with the default runtime when a grant requires
-JIT approval because no built-in approval transport dispatch is implemented
+JIT approval because the built-in Slack provider does not call the Slack API
 yet. Slack API calls and real approval timeouts are intentionally deferred.

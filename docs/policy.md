@@ -127,11 +127,13 @@ The transport name references an approval transport in `config.toml`.
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
 options = ["15m", "60m"]
 ```
 
-Transport configuration is intentionally separate from grants so Slack secrets
-and transport metadata do not live in policy files.
+Transport configuration is intentionally separate from grants so Slack channel
+settings and auth references do not live in policy files. Slack secret values
+live in `.auth.json`.
 
 `options` is optional. When present, each value becomes an approval option
 available to the transport. Heim maps `15m` to a default label of `Approve 15m`.
@@ -199,8 +201,8 @@ referenced approval transport, builds one approval request per transport, and
 asks an approval provider for a decision. Approved decisions continue to
 credential issuance and command execution. Denied, timed-out, unavailable, or
 invalid approval decisions fail closed and do not start the wrapped command.
-The default runtime currently fails closed because built-in approval transport
-dispatch is intentionally not implemented yet. Denied policy requests return
+The default runtime currently fails closed because built-in Slack dispatch does
+not call the Slack API yet. Denied policy requests return
 the policy denial exit code and do not start the wrapped command.
 
 During preflight, Heim also builds a local execution context:

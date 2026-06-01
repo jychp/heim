@@ -9,7 +9,7 @@ processes. It can also resolve a GitHub App private key, mint a GitHub App
 installation token, and inject that token into allowed `heim exec` child
 processes. It can issue AWS STS AssumeRole credentials for allowed commands
 through the AWS SDK credential chain. It can apply approval provider decisions,
-but does not call Slack or request approvals through a built-in transport yet.
+but the built-in Slack provider does not call the Slack API yet.
 
 ## Config File
 
@@ -44,6 +44,7 @@ token = { auth = "github_personal_pat" }
 [approval_transports.slack]
 type = "slack"
 channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
 options = ["15m", "60m"]
 ```
 
@@ -82,11 +83,12 @@ Approval transports are configured in `config.toml`, not policy files. Policy
 grants reference these transports by name with values such as `approval =
 "jit:slack"`.
 
-`slack` transport config describes a future Slack approval provider.
+`slack` transport config describes the built-in Slack approval provider.
 
 Required:
 
 - `channel`
+- `bot_token = { auth = "<entry>" }`
 
 Optional:
 
@@ -94,6 +96,10 @@ Optional:
 
 Each option id is mapped to a default approval label. For example, `15m`
 becomes `Approve 15m`.
+
+The `bot_token` auth entry resolves to a Slack bot token in `.auth.json`. The
+runtime validates and loads this secret before dispatching approval requests,
+but the built-in Slack API flow is still not implemented.
 
 ## Providers
 
@@ -165,6 +171,10 @@ Manager, or Infisical integrations when they are implemented.
   "github_personal_pat": {
     "type": "github_pat",
     "token": "redacted"
+  },
+  "slack_bot_token": {
+    "type": "slack_bot_token",
+    "token": "xoxb-redacted"
   }
 }
 ```
@@ -192,6 +202,7 @@ validated `.auth.json` file into typed secret material:
 
 - GitHub App private keys
 - GitHub PATs
+- Slack bot tokens
 
 It can also resolve the local secrets required by one configured provider:
 GitHub App providers require a private key, GitHub PAT providers require a
