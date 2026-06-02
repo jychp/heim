@@ -20,6 +20,16 @@ The default config file is:
 - macOS: `~/Library/Application Support/heim/config.toml`
 - Windows: `%APPDATA%\heim\config.toml`
 
+Create the default local config layout with:
+
+```bash
+heim init
+```
+
+`heim init` creates the platform config directory, `config.toml`, `policies/`,
+and `logs/` when they do not already exist. It does not overwrite existing
+files and does not create `.auth.json`.
+
 `config.toml` contains non-secret provider metadata.
 
 ```toml

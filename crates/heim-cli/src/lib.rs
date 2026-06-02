@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{ffi::OsStr, fmt};
@@ -46,6 +46,8 @@ struct Cli {
 enum Command {
     /// Check the local Heim CLI installation.
     Doctor,
+    /// Create the local Heim config layout.
+    Init,
     /// Execute a command with one or more named grants.
     Exec {
         /// Single policy file to evaluate instead of the default policy directory.
@@ -300,6 +302,7 @@ where
 {
     match cli.command {
         Some(Command::Doctor) => ok("heim: ok\n"),
+        Some(Command::Init) => run_init(),
         Some(Command::Exec {
             file,
             dir,
@@ -344,6 +347,17 @@ where
                 stderr: String::new(),
             }
         }
+    }
+}
+
+fn run_init() -> CommandResult {
+    match InitPaths::from_defaults().and_then(initialize_local_config) {
+        Ok(report) => ok(report.format()),
+        Err(error) => CommandResult {
+            code: 2,
+            stdout: String::new(),
+            stderr: format!("{error}\n"),
+        },
     }
 }
 
@@ -634,6 +648,213 @@ struct ExecCliRequest {
     config_source: ConfigSource,
     grants: Vec<String>,
     command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitPaths {
+    config_dir: PathBuf,
+    policy_dir: PathBuf,
+    log_dir: PathBuf,
+    config_file: PathBuf,
+    policy_file: PathBuf,
+    auth_file: PathBuf,
+}
+
+impl InitPaths {
+    fn from_defaults() -> Result<Self, InitError> {
+        let config_dir = heim_config::default_heim_config_dir().map_err(InitError::ConfigPath)?;
+        let policy_dir = heim_config::default_policy_dir().map_err(InitError::ConfigPath)?;
+        let log_dir = heim_config::default_log_dir().map_err(InitError::ConfigPath)?;
+        let config_file = heim_config::default_config_file().map_err(InitError::ConfigPath)?;
+        let auth_file = heim_config::default_auth_file().map_err(InitError::ConfigPath)?;
+        let policy_file = policy_dir.join("example.toml");
+
+        Ok(Self {
+            config_dir,
+            policy_dir,
+            log_dir,
+            config_file,
+            policy_file,
+            auth_file,
+        })
+    }
+
+    #[cfg(test)]
+    fn under(root: impl Into<PathBuf>) -> Self {
+        let config_dir = root.into();
+        let policy_dir = config_dir.join("policies");
+        let log_dir = config_dir.join("logs");
+        let config_file = config_dir.join("config.toml");
+        let auth_file = config_dir.join(".auth.json");
+        let policy_file = policy_dir.join("example.toml");
+
+        Self {
+            config_dir,
+            policy_dir,
+            log_dir,
+            config_file,
+            policy_file,
+            auth_file,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitReport {
+    created: Vec<PathBuf>,
+    skipped: Vec<PathBuf>,
+    auth_file: PathBuf,
+}
+
+impl InitReport {
+    fn format(&self) -> String {
+        let mut output = String::from("heim init: ok\n");
+
+        for path in &self.created {
+            output.push_str(&format!("created {}\n", path.display()));
+        }
+
+        for path in &self.skipped {
+            output.push_str(&format!("exists {}\n", path.display()));
+        }
+
+        output.push_str(&format!(
+            "auth file not created; create {} with owner-only permissions when local secrets are needed\n",
+            self.auth_file.display()
+        ));
+
+        output
+    }
+}
+
+fn initialize_local_config(paths: InitPaths) -> Result<InitReport, InitError> {
+    let mut report = InitReport {
+        created: Vec::new(),
+        skipped: Vec::new(),
+        auth_file: paths.auth_file.clone(),
+    };
+
+    ensure_dir(&paths.config_dir, &mut report)?;
+    ensure_dir(&paths.policy_dir, &mut report)?;
+    ensure_dir(&paths.log_dir, &mut report)?;
+    ensure_file(&paths.config_file, DEFAULT_INIT_CONFIG_TOML, &mut report)?;
+    ensure_file(&paths.policy_file, DEFAULT_INIT_POLICY_TOML, &mut report)?;
+
+    Ok(report)
+}
+
+fn ensure_dir(path: &Path, report: &mut InitReport) -> Result<(), InitError> {
+    if path.exists() {
+        if !path.is_dir() {
+            return Err(InitError::PathType {
+                path: path.display().to_string(),
+                expected: "directory",
+            });
+        }
+        report.skipped.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(path).map_err(|source| InitError::CreateDir {
+        path: path.display().to_string(),
+        source,
+    })?;
+    report.created.push(path.to_path_buf());
+    Ok(())
+}
+
+fn ensure_file(path: &Path, contents: &str, report: &mut InitReport) -> Result<(), InitError> {
+    if path.exists() {
+        if !path.is_file() {
+            return Err(InitError::PathType {
+                path: path.display().to_string(),
+                expected: "file",
+            });
+        }
+        report.skipped.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    std::fs::write(path, contents).map_err(|source| InitError::WriteFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    report.created.push(path.to_path_buf());
+    Ok(())
+}
+
+const DEFAULT_INIT_CONFIG_TOML: &str = r##"# Heim local config.
+#
+# This file stores non-secret provider and approval transport metadata.
+# Secret values belong in .auth.json or another source, not in config.toml.
+
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+region = "us-east-1"
+duration = "15m"
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
+options = ["15m", "60m"]
+"##;
+
+const DEFAULT_INIT_POLICY_TOML: &str = r#"# Heim local policy.
+#
+# Edit the requester binaries, commands, and provider names for your machine.
+
+[[grants]]
+name = "aws.prod-readonly"
+provider = "aws_prod"
+allow = ["codex", "claude-code"]
+commands = ["aws *", "claude-code *"]
+approval = "jit:slack"
+"#;
+
+#[derive(Debug)]
+enum InitError {
+    ConfigPath(heim_config::ConfigError),
+    CreateDir {
+        path: String,
+        source: std::io::Error,
+    },
+    WriteFile {
+        path: String,
+        source: std::io::Error,
+    },
+    PathType {
+        path: String,
+        expected: &'static str,
+    },
+}
+
+impl fmt::Display for InitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigPath(source) => write!(formatter, "{source}"),
+            Self::CreateDir { path, source } => {
+                write!(formatter, "failed to create directory {path}: {source}")
+            }
+            Self::WriteFile { path, source } => {
+                write!(formatter, "failed to write file {path}: {source}")
+            }
+            Self::PathType { path, expected } => {
+                write!(formatter, "{path} exists but is not a {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConfigPath(source) => Some(source),
+            Self::CreateDir { source, .. } | Self::WriteFile { source, .. } => Some(source),
+            Self::PathType { .. } => None,
+        }
+    }
 }
 
 fn load_policy_source(
@@ -1631,6 +1852,59 @@ mod tests {
         assert_eq!(result.code, 0);
         assert_eq!(result.stdout, "heim: ok\n");
         assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn init_layout_creates_default_config_policy_and_log_directories() {
+        let dir = TestDir::new("init");
+        let paths = super::InitPaths::under(dir.path().join("heim"));
+
+        let report = super::initialize_local_config(paths.clone()).expect("init layout");
+
+        assert_eq!(report.created.len(), 5);
+        assert!(paths.config_dir.is_dir());
+        assert!(paths.policy_dir.is_dir());
+        assert!(paths.log_dir.is_dir());
+        assert!(paths.config_file.is_file());
+        assert!(paths.policy_file.is_file());
+        assert!(!paths.auth_file.exists());
+        assert!(
+            fs::read_to_string(&paths.config_file)
+                .expect("read config")
+                .contains("[providers.aws_prod]")
+        );
+        assert!(
+            fs::read_to_string(&paths.policy_file)
+                .expect("read policy")
+                .contains("name = \"aws.prod-readonly\"")
+        );
+        heim_config::load_config_file(&paths.config_file).expect("valid generated config");
+        heim_config::load_policy_file(&paths.policy_file).expect("valid generated policy");
+        assert!(report.format().contains("auth file not created; create"));
+    }
+
+    #[test]
+    fn init_layout_does_not_overwrite_existing_files() {
+        let dir = TestDir::new("init-existing");
+        let paths = super::InitPaths::under(dir.path().join("heim"));
+        fs::create_dir_all(&paths.policy_dir).expect("create policy dir");
+        fs::create_dir_all(&paths.log_dir).expect("create log dir");
+        fs::write(&paths.config_file, "existing config").expect("write config");
+        fs::write(&paths.policy_file, "existing policy").expect("write policy");
+
+        let report = super::initialize_local_config(paths.clone()).expect("init layout");
+
+        assert!(report.created.is_empty());
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("read config"),
+            "existing config"
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.policy_file).expect("read policy"),
+            "existing policy"
+        );
+        assert!(report.skipped.contains(&paths.config_file));
+        assert!(report.skipped.contains(&paths.policy_file));
     }
 
     #[test]
@@ -3001,6 +3275,35 @@ options = ["15m", "60m"]
     impl Drop for TestFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+            let path = std::env::temp_dir().join(format!(
+                "heim-cli-{prefix}-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create test dir");
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
