@@ -34,6 +34,7 @@ still being finalized.
 heim --help
 heim --version
 heim doctor
+heim init
 heim exec <grant> [<grant> ...] -- <command> [args...]
 heim config
 heim config validate
@@ -45,7 +46,7 @@ heim audit list
 heim approvals
 ```
 
-Only `doctor`, `config validate`, `policy validate`, `policy check`, `exec`
+Only `doctor`, `init`, `config validate`, `policy validate`, `policy check`, `exec`
 policy preflight, approval request preparation, GitHub PAT environment
 injection for allowed `exec` requests, approval decision handling, allowed
 command execution, `audit list`, `--help`, and `--version` are implemented
@@ -99,6 +100,16 @@ supported but should be avoided for sensitive use when better sources are
 available. On Unix, Heim requires owner-only permissions for this file.
 The `heim-sources` crate can resolve these local auth references into typed
 secret material for providers, with redacted debug output.
+
+Create the default local config layout:
+
+```bash
+heim init
+```
+
+`heim init` creates the platform config directory, `config.toml`,
+`policies/example.toml`, and `logs/` when they do not already exist. It does
+not overwrite existing files and does not create `.auth.json`.
 
 The default config file can be validated:
 
