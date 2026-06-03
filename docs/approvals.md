@@ -77,6 +77,32 @@ Approval provider errors also fail closed.
 For `approved_with_option`, the selected option id must match one of the
 options configured for the transport.
 
+## Session
+
+An approval session is the runtime object that connects one approval request to
+one eventual decision. It contains:
+
+- session id
+- approval request
+- optional expiration timestamp
+- status
+
+Session status starts as `pending`. A session can resolve to `approved`,
+`approved_with_option`, `denied`, `timed_out`, or `expired`.
+
+The session model validates decisions before applying them. In particular,
+`approved_with_option` is accepted only when the selected option id exists on
+the original request. Once a session is resolved, later decisions are rejected.
+
+This prepares the daemon workflow without making a transport-specific storage
+choice yet:
+
+1. `heim exec` creates an approval request for a JIT policy decision.
+2. `heimd` creates a pending approval session.
+3. An approval transport presents the request to an approver.
+4. The transport sends back approve, deny, or approve-with-option.
+5. `heimd` resolves the session and `heim exec` applies the decision.
+
 ## Transports
 
 Policy references transports by name:

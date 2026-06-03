@@ -111,6 +111,10 @@ The `bot_token` auth entry resolves to a Slack bot token in `.auth.json`. The
 runtime validates and loads this secret before dispatching approval requests,
 but the built-in Slack API flow is still not implemented.
 
+Approval options are validated against the approval session. If a transport
+returns approve-with-option, the selected option id must exist in the original
+request options loaded from this config.
+
 ## Providers
 
 `aws_sts` config describes an AWS STS AssumeRole provider. It uses the AWS SDK

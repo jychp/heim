@@ -74,8 +74,10 @@ Grant policies can express:
 Policy evaluation can drive local preflight and allowed command execution.
 When JIT approval is required, Heim prepares transport-neutral approval
 requests from the execution context and config. It can apply approval decisions
-returned by an approval provider. The built-in Slack provider validates runtime
-config and secrets, but Slack API dispatch is not implemented yet.
+returned by an approval provider. `heim-approvals` also models runtime approval
+sessions so a daemon can connect one request to one eventual decision. The
+built-in Slack provider validates runtime config and secrets, but Slack API
+dispatch is not implemented yet.
 
 Policy files are loaded from the platform config directory by default:
 
@@ -180,8 +182,9 @@ override them for the wrapped command only.
 ## Local Daemon
 
 `heimd` is the local daemon boundary for long-lived interactive approval
-workflows such as Slack Socket Mode. The current daemon exposes a minimal local
-IPC protocol:
+workflows such as Slack Socket Mode. Approval sessions are modeled in
+`heim-approvals`; daemon storage and decision IPC are deferred. The current
+daemon exposes a minimal local IPC protocol:
 
 ```bash
 heimd doctor

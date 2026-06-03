@@ -1296,22 +1296,21 @@ fn validate_approval_decision(
     request: &ApprovalRequest,
     decision: ApprovalDecision,
 ) -> Result<(), ExecApprovalError> {
+    decision
+        .validate_for_request(request)
+        .map_err(|source| match source {
+            heim_approvals::ApprovalDecisionValidationError::UnconfiguredOption {
+                transport,
+                option,
+            } => ExecApprovalError::UnconfiguredApprovalOption {
+                transport: transport.to_string(),
+                option,
+            },
+        })?;
+
     match decision {
         ApprovalDecision::Approved(_) => Ok(()),
-        ApprovalDecision::ApprovedWithOption { option, .. } => {
-            if request
-                .options
-                .iter()
-                .any(|candidate| candidate.id == option.id)
-            {
-                Ok(())
-            } else {
-                Err(ExecApprovalError::UnconfiguredApprovalOption {
-                    transport: request.transport.to_string(),
-                    option: option.id,
-                })
-            }
-        }
+        ApprovalDecision::ApprovedWithOption { .. } => Ok(()),
         ApprovalDecision::Denied(_) => Err(ExecApprovalError::ApprovalDenied {
             transport: request.transport.to_string(),
         }),

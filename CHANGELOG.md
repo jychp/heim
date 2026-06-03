@@ -33,6 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   without credential injection yet.
 - Transport-neutral approval request and decision contract for future JIT
   approval providers.
+- Runtime approval session model that connects one approval request to one
+  validated decision.
 - `heim exec` approval request preparation for JIT policy decisions, including
   configured transport options, while approval dispatch remains deferred.
 - `heim exec` approval decision handling for approved, approved-with-option,
