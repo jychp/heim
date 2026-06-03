@@ -218,18 +218,52 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
         path: socket.display().to_string(),
         source,
     })?;
+    let _socket_file_guard = SocketFileGuard::new(socket);
 
     loop {
         let (stream, _) = listener
             .accept()
             .map_err(|source| DaemonError::AcceptConnection { source })?;
-        handle_stream(stream)?;
+        if let Err(error) = handle_stream(stream) {
+            handle_connection_error(error, once)?;
+        }
 
         if once {
             break;
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+struct SocketFileGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl SocketFileGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn handle_connection_error(error: DaemonError, once: bool) -> Result<(), DaemonError> {
+    if once {
+        return Err(error);
+    }
+
+    eprintln!("heimd: connection error: {error}");
     Ok(())
 }
 
@@ -435,5 +469,79 @@ mod tests {
         let response = super::handle_request(DaemonRequest::Ping);
 
         assert_eq!(response, DaemonResponse::Pong);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_file_guard_removes_socket_path_on_drop() {
+        let dir = TestDir::new("socket-file-guard");
+        let socket = dir.path().join("heimd.sock");
+        std::fs::write(&socket, b"socket").expect("socket file");
+
+        {
+            let _guard = super::SocketFileGuard::new(&socket);
+            assert!(socket.exists());
+        }
+
+        assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_once_propagates_connection_errors() {
+        let error = super::DaemonError::SocketExists {
+            path: "stale.sock".to_string(),
+        };
+
+        let result = super::handle_connection_error(error, true);
+
+        assert!(matches!(
+            result,
+            Err(super::DaemonError::SocketExists { path }) if path == "stale.sock"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_forever_keeps_running_after_connection_errors() {
+        let error = super::DaemonError::SocketExists {
+            path: "stale.sock".to_string(),
+        };
+
+        let result = super::handle_connection_error(error, false);
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "heimd-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
