@@ -26,9 +26,9 @@ Create the default local config layout with:
 heim init
 ```
 
-`heim init` creates the platform config directory, `config.toml`, `policies/`,
-and `logs/` when they do not already exist. It does not overwrite existing
-files and does not create `.auth.json`.
+`heim init` creates the platform config directory, `config.toml`,
+`policies/example.toml`, and `logs/` when they do not already exist. It does
+not overwrite existing files and does not create `.auth.json`.
 
 `config.toml` contains non-secret provider metadata.
 
