@@ -7,3 +7,4 @@ Project documentation lives here while the specification is in progress.
   unsafe local auth file schema.
 - `audit.md` describes the current audit event model and JSONL sink.
 - `approvals.md` describes the approval provider contract.
+- `daemon.md` describes the local daemon boundary and initial IPC protocol.

@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Initial typed CLI command surface for `heim`.
 - `heim init` for creating the default local config, policy, and log layout
   without overwriting existing files.
+- `heimd` local daemon skeleton with Unix socket `ping`/`pong` IPC for future
+  long-lived approval workflows.
 - Core grant policy primitives for named grants, requester rules, command
   wildcards, and grant vs JIT approval modes.
 - Draft policy documentation and example policy configuration.

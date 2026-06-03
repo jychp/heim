@@ -35,6 +35,9 @@ heim --help
 heim --version
 heim doctor
 heim init
+heimd doctor
+heimd serve
+heimd ping
 heim exec <grant> [<grant> ...] -- <command> [args...]
 heim config
 heim config validate
@@ -46,12 +49,13 @@ heim audit list
 heim approvals
 ```
 
-Only `doctor`, `init`, `config validate`, `policy validate`, `policy check`, `exec`
-policy preflight, approval request preparation, GitHub PAT environment
+Only `doctor`, `init`, `config validate`, `policy validate`, `policy check`,
+`exec` policy preflight, approval request preparation, GitHub PAT environment
 injection for allowed `exec` requests, approval decision handling, allowed
-command execution, `audit list`, `--help`, and `--version` are implemented
-today. The other commands are parsed and return an explicit "not implemented
-yet" error until their behavior is accepted.
+command execution, `audit list`, `heimd doctor`, `heimd serve`, `heimd ping`,
+`--help`, and `--version` are implemented today. The other commands are parsed
+and return an explicit "not implemented yet" error until their behavior is
+accepted.
 
 ## Grant Policy Model
 
@@ -173,6 +177,22 @@ Injected variables are scoped to the child process. If `GH_TOKEN` or
 `GITHUB_TOKEN` already exist in the parent environment, Heim's issued values
 override them for the wrapped command only.
 
+## Local Daemon
+
+`heimd` is the local daemon boundary for long-lived interactive approval
+workflows such as Slack Socket Mode. The current daemon exposes a minimal local
+IPC protocol:
+
+```bash
+heimd doctor
+heimd serve
+heimd ping
+```
+
+On Unix platforms, `heimd serve` listens on a Unix socket and `heimd ping`
+checks that a daemon responds with `pong`. Windows named pipe support is
+deferred.
+
 The `heim-exec` crate builds the local execution context used by this preflight:
 requested grants, inferred requester, wrapped command, current working
 directory, and Git remote or branch metadata when they can be detected. This
@@ -237,6 +257,7 @@ crates/heim-providers/
 crates/heim-sources/
 crates/heim-audit/
 crates/heim-exec/
+crates/heimd/
 examples/
 docs/
 ```
