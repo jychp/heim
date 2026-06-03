@@ -8,12 +8,15 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 pub use heim_core::ApprovalTransportName;
 
 /// Request context sent to one approval transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub request_id: String,
+    #[serde(with = "approval_transport_name_serde")]
     pub transport: ApprovalTransportName,
     pub grants: Vec<ApprovalGrant>,
     pub requester: String,
@@ -209,7 +212,7 @@ impl fmt::Display for ApprovalRequestBuildError {
 impl std::error::Error for ApprovalRequestBuildError {}
 
 /// One grant included in an approval request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalGrant {
     pub name: String,
     pub provider: String,
@@ -225,7 +228,7 @@ impl ApprovalGrant {
 }
 
 /// Git metadata included in an approval request when available.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalGitContext {
     pub remote: Option<String>,
     pub branch: Option<String>,
@@ -238,7 +241,7 @@ impl ApprovalGitContext {
 }
 
 /// Provider-configured approval option, such as a duration button.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalOption {
     pub id: String,
     pub label: String,
@@ -254,24 +257,32 @@ impl ApprovalOption {
 }
 
 /// Transport-neutral approval outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalDecision {
-    Approved(ApprovalGrantDecision),
+    Approved {
+        decision: ApprovalGrantDecision,
+    },
     ApprovedWithOption {
         decision: ApprovalGrantDecision,
         option: ApprovalOption,
     },
-    Denied(ApprovalGrantDecision),
+    Denied {
+        decision: ApprovalGrantDecision,
+    },
     TimedOut,
 }
 
 impl ApprovalDecision {
     pub fn is_approved(&self) -> bool {
-        matches!(self, Self::Approved(_) | Self::ApprovedWithOption { .. })
+        matches!(
+            self,
+            Self::Approved { .. } | Self::ApprovedWithOption { .. }
+        )
     }
 
     pub fn is_denied(&self) -> bool {
-        matches!(self, Self::Denied(_))
+        matches!(self, Self::Denied { .. })
     }
 
     pub fn validate_for_request(
@@ -279,7 +290,7 @@ impl ApprovalDecision {
         request: &ApprovalRequest,
     ) -> Result<(), ApprovalDecisionValidationError> {
         match self {
-            Self::Approved(_) | Self::Denied(_) | Self::TimedOut => Ok(()),
+            Self::Approved { .. } | Self::Denied { .. } | Self::TimedOut => Ok(()),
             Self::ApprovedWithOption { option, .. } => {
                 if request
                     .options
@@ -321,7 +332,7 @@ impl fmt::Display for ApprovalDecisionValidationError {
 impl std::error::Error for ApprovalDecisionValidationError {}
 
 /// Runtime approval session tracked while an approval request is pending.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSession {
     id: String,
     request: ApprovalRequest,
@@ -398,15 +409,20 @@ impl ApprovalSession {
 }
 
 /// Current state of an approval session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalSessionStatus {
     Pending,
-    Approved(ApprovalGrantDecision),
+    Approved {
+        decision: ApprovalGrantDecision,
+    },
     ApprovedWithOption {
         decision: ApprovalGrantDecision,
         option: ApprovalOption,
     },
-    Denied(ApprovalGrantDecision),
+    Denied {
+        decision: ApprovalGrantDecision,
+    },
     TimedOut,
     Expired,
 }
@@ -414,11 +430,11 @@ pub enum ApprovalSessionStatus {
 impl From<ApprovalDecision> for ApprovalSessionStatus {
     fn from(decision: ApprovalDecision) -> Self {
         match decision {
-            ApprovalDecision::Approved(decision) => Self::Approved(decision),
+            ApprovalDecision::Approved { decision } => Self::Approved { decision },
             ApprovalDecision::ApprovedWithOption { decision, option } => {
                 Self::ApprovedWithOption { decision, option }
             }
-            ApprovalDecision::Denied(decision) => Self::Denied(decision),
+            ApprovalDecision::Denied { decision } => Self::Denied { decision },
             ApprovalDecision::TimedOut => Self::TimedOut,
         }
     }
@@ -456,8 +472,29 @@ impl std::error::Error for ApprovalSessionError {
     }
 }
 
+mod approval_transport_name_serde {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    use super::ApprovalTransportName;
+
+    pub fn serialize<S>(transport: &ApprovalTransportName, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(transport.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ApprovalTransportName, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        ApprovalTransportName::new(value).map_err(D::Error::custom)
+    }
+}
+
 /// Metadata supplied by an approval transport when a human decides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalGrantDecision {
     pub approver: String,
     pub decided_at: String,
@@ -779,14 +816,16 @@ mod tests {
 
     #[test]
     fn approval_decision_reports_outcome() {
-        let approved =
-            ApprovalDecision::Approved(ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"));
+        let approved = ApprovalDecision::Approved {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+        };
         let approved_with_option = ApprovalDecision::ApprovedWithOption {
             decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
             option: ApprovalOption::new("15m", "Approve 15m"),
         };
-        let denied =
-            ApprovalDecision::Denied(ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"));
+        let denied = ApprovalDecision::Denied {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+        };
 
         assert!(approved.is_approved());
         assert!(approved_with_option.is_approved());
@@ -869,18 +908,16 @@ mod tests {
             .expect("approval session");
 
         session
-            .apply_decision(ApprovalDecision::Denied(ApprovalGrantDecision::new(
-                "alice",
-                "2026-05-24T12:00:00Z",
-            )))
+            .apply_decision(ApprovalDecision::Denied {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })
             .expect("approval decision");
 
         assert_eq!(
             session.status(),
-            &ApprovalSessionStatus::Denied(ApprovalGrantDecision::new(
-                "alice",
-                "2026-05-24T12:00:00Z"
-            ))
+            &ApprovalSessionStatus::Denied {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z")
+            }
         );
     }
 
@@ -893,10 +930,9 @@ mod tests {
             .expect("timeout decision");
 
         let error = session
-            .apply_decision(ApprovalDecision::Approved(ApprovalGrantDecision::new(
-                "alice",
-                "2026-05-24T12:00:00Z",
-            )))
+            .apply_decision(ApprovalDecision::Approved {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })
             .expect_err("already resolved");
 
         assert_eq!(
@@ -926,10 +962,9 @@ mod tests {
         let mut session = ApprovalSession::new("session-1", approval_request_with_options(), None)
             .expect("approval session");
         session
-            .apply_decision(ApprovalDecision::Approved(ApprovalGrantDecision::new(
-                "alice",
-                "2026-05-24T12:00:00Z",
-            )))
+            .apply_decision(ApprovalDecision::Approved {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })
             .expect("approval decision");
 
         let error = session.expire().expect_err("already resolved");
@@ -959,6 +994,56 @@ mod tests {
             "approval transport slack returned unconfigured option 24h"
         );
         assert!(session.is_pending());
+    }
+
+    #[test]
+    fn approval_request_serializes_transport_as_name() {
+        let request = approval_request_with_options();
+
+        let json = serde_json::to_string(&request).expect("serialize request");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        let parsed: ApprovalRequest = serde_json::from_str(&json).expect("deserialize request");
+
+        assert_eq!(value["transport"], "slack");
+        assert_eq!(value["options"][0]["id"], "15m");
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn approval_decision_serializes_as_tagged_json() {
+        let decision = ApprovalDecision::ApprovedWithOption {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            option: ApprovalOption::new("15m", "Approve 15m"),
+        };
+
+        let json = serde_json::to_string(&decision).expect("serialize decision");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        let parsed: ApprovalDecision = serde_json::from_str(&json).expect("deserialize decision");
+
+        assert_eq!(value["type"], "approved_with_option");
+        assert_eq!(value["decision"]["approver"], "alice");
+        assert_eq!(value["option"]["id"], "15m");
+        assert_eq!(parsed, decision);
+    }
+
+    #[test]
+    fn approval_session_serializes_status() {
+        let mut session = ApprovalSession::new("session-1", approval_request_with_options(), None)
+            .expect("approval session");
+        session
+            .apply_decision(ApprovalDecision::Denied {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })
+            .expect("approval decision");
+
+        let json = serde_json::to_string(&session).expect("serialize session");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        let parsed: ApprovalSession = serde_json::from_str(&json).expect("deserialize session");
+
+        assert_eq!(value["id"], "session-1");
+        assert_eq!(value["request"]["transport"], "slack");
+        assert_eq!(value["status"]["type"], "denied");
+        assert_eq!(parsed, session);
     }
 
     #[test]
@@ -1020,9 +1105,9 @@ mod tests {
 
     #[test]
     fn slack_provider_delegates_requests_to_client() {
-        let client = RecordingSlackClient::new(ApprovalDecision::Approved(
-            ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
-        ));
+        let client = RecordingSlackClient::new(ApprovalDecision::Approved {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+        });
         let provider = SlackApprovalProvider::new(
             ApprovalTransportName::new("slack").expect("valid transport"),
             "#heim-approvals",

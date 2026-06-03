@@ -9,6 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 heim-core = { version = "0.1.0", path = "../heim-core" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

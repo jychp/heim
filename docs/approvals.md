@@ -94,6 +94,11 @@ The session model validates decisions before applying them. In particular,
 `approved_with_option` is accepted only when the selected option id exists on
 the original request. Once a session is resolved, later decisions are rejected.
 
+Requests, decisions, and sessions are serializable as JSON. Decision and status
+enums use a `type` field with snake-case values such as
+`approved_with_option`, `denied`, or `expired`. The approval transport name is
+serialized as the configured transport string, such as `slack`.
+
 This prepares the daemon workflow without making a transport-specific storage
 choice yet:
 
