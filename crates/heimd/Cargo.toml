@@ -1,0 +1,21 @@
+[package]
+name = "heimd"
+description = "Local daemon for Heim approval workflows."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+heim-config = { version = "0.1.0", path = "../heim-config" }
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "heimd"
+path = "src/main.rs"
+
+[lints]
+workspace = true

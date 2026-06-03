@@ -4,10 +4,11 @@ Guidance for AI coding agents working on Heim.
 
 ## Current State
 
-This repository is currently a scaffold. The product spec is not finalized.
+This repository is an early implementation. The product spec is not finalized.
 
-Avoid implementing product logic until the relevant behavior has been accepted.
-Scaffolding, build wiring, formatting, CI, and empty crate boundaries are fine.
+Avoid implementing new product behavior until the relevant behavior has been
+accepted. Scaffolding, build wiring, formatting, CI, and narrow crate
+boundaries are fine.
 
 After any significant project structure or workflow change, verify this file
 still reflects the current repository state and update it if needed.

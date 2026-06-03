@@ -9,6 +9,7 @@ members = [
     "crates/heim-policy",
     "crates/heim-providers",
     "crates/heim-sources",
+    "crates/heimd",
 ]
 resolver = "2"
 
