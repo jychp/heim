@@ -239,6 +239,14 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
 #[cfg(unix)]
 struct SocketFileGuard {
     path: PathBuf,
+    identity: Option<SocketFileIdentity>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct SocketFileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[cfg(unix)]
@@ -246,6 +254,7 @@ impl SocketFileGuard {
     fn new(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
+            identity: SocketFileIdentity::current(path),
         }
     }
 }
@@ -253,7 +262,35 @@ impl SocketFileGuard {
 #[cfg(unix)]
 impl Drop for SocketFileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let Some(identity) = self.identity else {
+            return;
+        };
+
+        if identity.matches(&self.path) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl SocketFileIdentity {
+    fn current(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_socket() {
+            return None;
+        }
+
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn matches(self, path: &Path) -> bool {
+        Self::current(path)
+            .is_some_and(|current| current.device == self.device && current.inode == self.inode)
     }
 }
 
@@ -473,17 +510,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_file_guard_removes_socket_path_on_drop() {
+    fn socket_file_guard_preserves_non_socket_file_on_drop() {
         let dir = TestDir::new("socket-file-guard");
         let socket = dir.path().join("heimd.sock");
-        std::fs::write(&socket, b"socket").expect("socket file");
+        std::fs::write(&socket, b"replacement").expect("replacement file");
 
         {
             let _guard = super::SocketFileGuard::new(&socket);
             assert!(socket.exists());
         }
 
-        assert!(!socket.exists());
+        assert_eq!(
+            std::fs::read(&socket).expect("replacement file"),
+            b"replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_file_guard_preserves_replaced_file_on_drop() {
+        let dir = TestDir::new("socket-file-replacement-guard");
+        let socket = dir.path().join("heimd.sock");
+        let guard = super::SocketFileGuard {
+            path: socket.clone(),
+            identity: Some(super::SocketFileIdentity {
+                device: u64::MAX,
+                inode: u64::MAX,
+            }),
+        };
+        std::fs::write(&socket, b"replacement").expect("replacement file");
+
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read(&socket).expect("replacement file"),
+            b"replacement"
+        );
     }
 
     #[cfg(unix)]
