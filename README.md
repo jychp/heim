@@ -182,9 +182,10 @@ override them for the wrapped command only.
 ## Local Daemon
 
 `heimd` is the local daemon boundary for long-lived interactive approval
-workflows such as Slack Socket Mode. Approval sessions are modeled in
-`heim-approvals`; daemon storage and decision IPC are deferred. The current
-daemon exposes a minimal local IPC protocol:
+workflows such as Slack Socket Mode. The daemon stores approval sessions in
+memory and exposes JSONL IPC messages to create, read, and decide those
+sessions. `approval_wait`, persistent storage, and Slack Socket Mode dispatch
+are deferred. The current daemon also exposes a health protocol:
 
 ```bash
 heimd doctor

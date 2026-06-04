@@ -100,14 +100,13 @@ enums use a `type` field with snake-case values such as
 `approved_with_option`, `denied`, or `expired`. The approval transport name is
 serialized as the configured transport string, such as `slack`.
 
-This prepares the future daemon workflow without making a transport-specific
-storage choice yet:
+This backs the daemon approval workflow without tying the model to Slack:
 
 1. `heim exec` creates an approval request for a JIT policy decision.
-2. `heimd` will create a pending approval session.
+2. `heimd` creates a pending approval session.
 3. An approval transport presents the request to an approver.
 4. The transport sends back approve, deny, or approve-with-option.
-5. `heimd` will resolve the session and `heim exec` will apply the decision.
+5. `heimd` resolves the session and `heim exec` applies the decision.
 
 ## Transports
 

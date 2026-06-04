@@ -3,6 +3,7 @@
 //! `heimd` owns long-lived local IPC needed by interactive approval transports.
 //! Slack Socket Mode will build on this daemon boundary in a later change.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -10,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
+use heim_approvals::{ApprovalDecision, ApprovalRequest, ApprovalSession};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +123,7 @@ fn run_ping(socket: Option<PathBuf>) -> CommandResult {
 
     match ping_daemon(&socket) {
         Ok(DaemonResponse::Pong) => ok("pong\n"),
+        Ok(response) => command_error(2, format!("unexpected daemon response: {response:?}\n")),
         Err(error) => command_error(2, format!("{error}\n")),
     }
 }
@@ -145,17 +148,150 @@ fn default_socket_path_from_env(
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Ping,
+    ApprovalCreate {
+        session_id: String,
+        request: ApprovalRequest,
+        expires_at: Option<String>,
+    },
+    ApprovalGet {
+        session_id: String,
+    },
+    ApprovalDecide {
+        session_id: String,
+        decision: ApprovalDecision,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
     Pong,
+    ApprovalCreated { session: ApprovalSession },
+    ApprovalSession { session: ApprovalSession },
+    ApprovalDecided { session: ApprovalSession },
+    Error { message: String },
 }
 
-fn handle_request(request: DaemonRequest) -> DaemonResponse {
+#[derive(Debug, Default)]
+pub struct DaemonState {
+    approvals: ApprovalSessionStore,
+}
+
+impl DaemonState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ApprovalSessionStore {
+    sessions: BTreeMap<String, ApprovalSession>,
+}
+
+impl ApprovalSessionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn create(
+        &mut self,
+        session_id: String,
+        request: ApprovalRequest,
+        expires_at: Option<String>,
+    ) -> Result<ApprovalSession, ApprovalSessionStoreError> {
+        if self.sessions.contains_key(&session_id) {
+            return Err(ApprovalSessionStoreError::DuplicateSession { session_id });
+        }
+
+        let session = ApprovalSession::new(session_id.clone(), request, expires_at)
+            .map_err(ApprovalSessionStoreError::Session)?;
+        self.sessions.insert(session_id, session.clone());
+        Ok(session)
+    }
+
+    pub fn get(&self, session_id: &str) -> Result<ApprovalSession, ApprovalSessionStoreError> {
+        self.sessions.get(session_id).cloned().ok_or_else(|| {
+            ApprovalSessionStoreError::MissingSession {
+                session_id: session_id.to_owned(),
+            }
+        })
+    }
+
+    pub fn decide(
+        &mut self,
+        session_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalSession, ApprovalSessionStoreError> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            ApprovalSessionStoreError::MissingSession {
+                session_id: session_id.to_owned(),
+            }
+        })?;
+        session
+            .apply_decision(decision)
+            .map_err(ApprovalSessionStoreError::Session)?;
+        Ok(session.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalSessionStoreError {
+    DuplicateSession { session_id: String },
+    MissingSession { session_id: String },
+    Session(heim_approvals::ApprovalSessionError),
+}
+
+impl fmt::Display for ApprovalSessionStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateSession { session_id } => {
+                write!(formatter, "approval session {session_id} already exists")
+            }
+            Self::MissingSession { session_id } => {
+                write!(formatter, "approval session {session_id} was not found")
+            }
+            Self::Session(source) => write!(formatter, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for ApprovalSessionStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Session(source) => Some(source),
+            Self::DuplicateSession { .. } | Self::MissingSession { .. } => None,
+        }
+    }
+}
+
+fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
+        DaemonRequest::ApprovalCreate {
+            session_id,
+            request,
+            expires_at,
+        } => match state.approvals.create(session_id, request, expires_at) {
+            Ok(session) => DaemonResponse::ApprovalCreated { session },
+            Err(error) => DaemonResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        DaemonRequest::ApprovalGet { session_id } => match state.approvals.get(&session_id) {
+            Ok(session) => DaemonResponse::ApprovalSession { session },
+            Err(error) => DaemonResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        DaemonRequest::ApprovalDecide {
+            session_id,
+            decision,
+        } => match state.approvals.decide(&session_id, decision) {
+            Ok(session) => DaemonResponse::ApprovalDecided { session },
+            Err(error) => DaemonResponse::Error {
+                message: error.to_string(),
+            },
+        },
     }
 }
 
@@ -219,12 +355,13 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
         source,
     })?;
     let _socket_file_guard = SocketFileGuard::new(socket);
+    let mut state = DaemonState::new();
 
     loop {
         let (stream, _) = listener
             .accept()
             .map_err(|source| DaemonError::AcceptConnection { source })?;
-        if let Err(error) = handle_stream(stream) {
+        if let Err(error) = handle_stream(&mut state, stream) {
             handle_connection_error(error, once)?;
         }
 
@@ -305,7 +442,10 @@ fn handle_connection_error(error: DaemonError, once: bool) -> Result<(), DaemonE
 }
 
 #[cfg(unix)]
-fn handle_stream(stream: std::os::unix::net::UnixStream) -> Result<(), DaemonError> {
+fn handle_stream(
+    state: &mut DaemonState,
+    stream: std::os::unix::net::UnixStream,
+) -> Result<(), DaemonError> {
     let reader = stream
         .try_clone()
         .map_err(|source| DaemonError::CloneConnection { source })?;
@@ -315,7 +455,7 @@ fn handle_stream(stream: std::os::unix::net::UnixStream) -> Result<(), DaemonErr
         .read_line(&mut line)
         .map_err(|source| DaemonError::ReadConnection { source })?;
     let request = serde_json::from_str::<DaemonRequest>(&line).map_err(DaemonError::Parse)?;
-    let response = handle_request(request);
+    let response = handle_request(state, request);
     let line = encode_response(&response)?;
     let mut writer = stream;
     writer
@@ -467,8 +607,13 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
+    use heim_approvals::{
+        ApprovalDecision, ApprovalGrant, ApprovalGrantDecision, ApprovalOption, ApprovalRequest,
+        ApprovalSessionStatus, ApprovalTransportName,
+    };
+
     use super::{
-        DaemonRequest, DaemonResponse, default_socket_path_from_env, encode_request,
+        DaemonRequest, DaemonResponse, DaemonState, default_socket_path_from_env, encode_request,
         encode_response, run_from,
     };
 
@@ -491,6 +636,49 @@ mod tests {
     }
 
     #[test]
+    fn daemon_protocol_serializes_approval_create() {
+        let request = encode_request(&DaemonRequest::ApprovalCreate {
+            session_id: "session-1".to_owned(),
+            request: approval_request(),
+            expires_at: Some("2026-05-24T12:15:00Z".to_owned()),
+        })
+        .expect("request");
+        let value: serde_json::Value = serde_json::from_str(request.trim()).expect("json");
+
+        assert_eq!(value["type"], "approval_create");
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["request"]["transport"], "slack");
+        assert_eq!(value["expires_at"], "2026-05-24T12:15:00Z");
+    }
+
+    #[test]
+    fn daemon_protocol_serializes_approval_get_and_session_response() {
+        let session = heim_approvals::ApprovalSession::new(
+            "session-1",
+            approval_request(),
+            Some("2026-05-24T12:15:00Z".to_owned()),
+        )
+        .expect("approval session");
+        let request = encode_request(&DaemonRequest::ApprovalGet {
+            session_id: "session-1".to_owned(),
+        })
+        .expect("request");
+        let response =
+            encode_response(&DaemonResponse::ApprovalSession { session }).expect("response");
+        let request_value: serde_json::Value =
+            serde_json::from_str(request.trim()).expect("request json");
+        let response_value: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("response json");
+
+        assert_eq!(request_value["type"], "approval_get");
+        assert_eq!(request_value["session_id"], "session-1");
+        assert_eq!(response_value["type"], "approval_session");
+        assert_eq!(response_value["session"]["id"], "session-1");
+        assert_eq!(response_value["session"]["request"]["transport"], "slack");
+        assert_eq!(response_value["session"]["status"]["type"], "pending");
+    }
+
+    #[test]
     fn default_socket_path_prefers_xdg_runtime_dir() {
         let path = default_socket_path_from_env(|name| match name {
             "XDG_RUNTIME_DIR" => Some(OsString::from("/tmp/runtime")),
@@ -503,9 +691,141 @@ mod tests {
 
     #[test]
     fn daemon_handles_ping_as_pong() {
-        let response = super::handle_request(DaemonRequest::Ping);
+        let mut state = DaemonState::new();
+        let response = super::handle_request(&mut state, DaemonRequest::Ping);
 
         assert_eq!(response, DaemonResponse::Pong);
+    }
+
+    #[test]
+    fn daemon_creates_and_gets_approval_session() {
+        let mut state = DaemonState::new();
+
+        let create_response = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+        let get_response = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalGet {
+                session_id: "session-1".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            create_response,
+            DaemonResponse::ApprovalCreated { ref session } if session.id() == "session-1"
+        ));
+        assert!(matches!(
+            get_response,
+            DaemonResponse::ApprovalSession { ref session } if session.id() == "session-1"
+        ));
+    }
+
+    #[test]
+    fn daemon_rejects_duplicate_approval_session() {
+        let mut state = DaemonState::new();
+        let create = DaemonRequest::ApprovalCreate {
+            session_id: "session-1".to_owned(),
+            request: approval_request(),
+            expires_at: None,
+        };
+
+        let first = super::handle_request(&mut state, create.clone());
+        let second = super::handle_request(&mut state, create);
+
+        assert!(matches!(first, DaemonResponse::ApprovalCreated { .. }));
+        assert!(matches!(
+            second,
+            DaemonResponse::Error { ref message }
+                if message == "approval session session-1 already exists"
+        ));
+    }
+
+    #[test]
+    fn daemon_decides_approval_session() {
+        let mut state = DaemonState::new();
+        let _ = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+
+        let response = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalDecide {
+                session_id: "session-1".to_owned(),
+                decision: ApprovalDecision::ApprovedWithOption {
+                    decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                    option: ApprovalOption::new("15m", "Approve 15m"),
+                },
+            },
+        );
+
+        assert!(matches!(
+            response,
+            DaemonResponse::ApprovalDecided { ref session }
+                if session.status()
+                    == &ApprovalSessionStatus::ApprovedWithOption {
+                        decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                        option: ApprovalOption::new("15m", "Approve 15m"),
+                    }
+        ));
+    }
+
+    #[test]
+    fn daemon_rejects_invalid_approval_decision() {
+        let mut state = DaemonState::new();
+        let _ = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+
+        let response = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalDecide {
+                session_id: "session-1".to_owned(),
+                decision: ApprovalDecision::ApprovedWithOption {
+                    decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                    option: ApprovalOption::new("15m", "Approve 24h"),
+                },
+            },
+        );
+
+        assert!(matches!(
+            response,
+            DaemonResponse::Error { ref message }
+                if message == "approval transport slack returned unconfigured option 15m"
+        ));
+    }
+
+    #[test]
+    fn daemon_reports_missing_approval_session() {
+        let mut state = DaemonState::new();
+
+        let response = super::handle_request(
+            &mut state,
+            DaemonRequest::ApprovalGet {
+                session_id: "missing".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            response,
+            DaemonResponse::Error { ref message }
+                if message == "approval session missing was not found"
+        ));
     }
 
     #[cfg(unix)]
@@ -605,5 +925,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn approval_request() -> ApprovalRequest {
+        ApprovalRequest::builder(
+            "request-1",
+            ApprovalTransportName::new("slack").expect("transport"),
+        )
+        .grants([ApprovalGrant::new("aws.prod-readonly", "aws_prod")])
+        .requester("codex")
+        .command(["aws", "sts", "get-caller-identity"])
+        .cwd("/workspace")
+        .options([ApprovalOption::new("15m", "Approve 15m")])
+        .build()
+        .expect("approval request")
     }
 }

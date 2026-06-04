@@ -864,6 +864,7 @@ name = "heimd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "heim-approvals",
  "heim-config",
  "serde",
  "serde_json",

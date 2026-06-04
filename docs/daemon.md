@@ -4,7 +4,8 @@
 required for future transports that need to receive asynchronous decisions, such
 as Slack Socket Mode.
 
-The current daemon implements a minimal local IPC health protocol:
+The current daemon implements a local JSONL IPC protocol for health checks and
+in-memory approval sessions:
 
 ```bash
 heimd doctor
@@ -26,33 +27,67 @@ changing approval request semantics.
 
 ## Protocol
 
-Request:
+Ping request:
 
 ```json
 {"type":"ping"}
 ```
 
-Response:
+Ping response:
 
 ```json
 {"type":"pong"}
 ```
 
-Future approval messages will extend this protocol without changing the
-transport-neutral approval request and decision contract.
-
 ## Approval Sessions
 
-`heim-approvals` now defines the runtime approval session model that future
-daemon IPC messages will carry. A session wraps one approval request, an
-session id, optional expiration timestamp, and a status.
+`heim-approvals` defines the runtime approval session model used by daemon IPC.
+A session wraps a session id, one approval request, an optional expiration
+timestamp, and a status.
 
-The daemon does not store approval sessions yet. The intended next protocol
-extension is:
+The daemon stores approval sessions in memory for the lifetime of the process.
+It supports:
 
 - create a pending approval session from a JIT approval request
-- wait for a session decision
+- get an existing approval session
 - resolve a session with approve, deny, or approve-with-option
 
+Create request:
+
+```json
+{"type":"approval_create","session_id":"session-1","request":{"request_id":"request-1","transport":"slack","grants":[{"name":"aws.prod-readonly","provider":"aws_prod"}],"requester":"codex","command":["aws","sts","get-caller-identity"],"cwd":"/workspace","git":null,"options":[{"id":"15m","label":"Approve 15m"}]},"expires_at":"2026-05-24T12:15:00Z"}
+```
+
+Create response:
+
+```json
+{"type":"approval_created","session":{"id":"session-1","request":{"request_id":"request-1","transport":"slack","grants":[{"name":"aws.prod-readonly","provider":"aws_prod"}],"requester":"codex","command":["aws","sts","get-caller-identity"],"cwd":"/workspace","git":null,"options":[{"id":"15m","label":"Approve 15m"}]},"expires_at":"2026-05-24T12:15:00Z","status":{"type":"pending"}}}
+```
+
+Get request:
+
+```json
+{"type":"approval_get","session_id":"session-1"}
+```
+
+Decision request:
+
+```json
+{"type":"approval_decide","session_id":"session-1","decision":{"type":"approved_with_option","decision":{"approver":"alice","decided_at":"2026-05-24T12:00:00Z"},"option":{"id":"15m","label":"Approve 15m"}}}
+```
+
+Decision response:
+
+```json
+{"type":"approval_decided","session":{"id":"session-1","request":{"request_id":"request-1","transport":"slack","grants":[{"name":"aws.prod-readonly","provider":"aws_prod"}],"requester":"codex","command":["aws","sts","get-caller-identity"],"cwd":"/workspace","git":null,"options":[{"id":"15m","label":"Approve 15m"}]},"expires_at":"2026-05-24T12:15:00Z","status":{"type":"approved_with_option","decision":{"approver":"alice","decided_at":"2026-05-24T12:00:00Z"},"option":{"id":"15m","label":"Approve 15m"}}}}
+```
+
+Functional errors are returned as JSON responses:
+
+```json
+{"type":"error","message":"approval session missing was not found"}
+```
+
+`approval_wait` and persistent session storage are intentionally deferred.
 Slack Socket Mode and other asynchronous transports can build on this session
 boundary without changing the core approval request and decision schema.
