@@ -40,3 +40,19 @@ Response:
 
 Future approval messages will extend this protocol without changing the
 transport-neutral approval request and decision contract.
+
+## Approval Sessions
+
+`heim-approvals` now defines the runtime approval session model that future
+daemon IPC messages will carry. A session wraps one approval request, an
+session id, optional expiration timestamp, and a status.
+
+The daemon does not store approval sessions yet. The intended next protocol
+extension is:
+
+- create a pending approval session from a JIT approval request
+- wait for a session decision
+- resolve a session with approve, deny, or approve-with-option
+
+Slack Socket Mode and other asynchronous transports can build on this session
+boundary without changing the core approval request and decision schema.

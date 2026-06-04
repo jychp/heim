@@ -1296,23 +1296,22 @@ fn validate_approval_decision(
     request: &ApprovalRequest,
     decision: ApprovalDecision,
 ) -> Result<(), ExecApprovalError> {
+    decision
+        .validate_for_request(request)
+        .map_err(|source| match source {
+            heim_approvals::ApprovalDecisionValidationError::UnconfiguredOption {
+                transport,
+                option,
+            } => ExecApprovalError::UnconfiguredApprovalOption {
+                transport: transport.to_string(),
+                option,
+            },
+        })?;
+
     match decision {
-        ApprovalDecision::Approved(_) => Ok(()),
-        ApprovalDecision::ApprovedWithOption { option, .. } => {
-            if request
-                .options
-                .iter()
-                .any(|candidate| candidate.id == option.id)
-            {
-                Ok(())
-            } else {
-                Err(ExecApprovalError::UnconfiguredApprovalOption {
-                    transport: request.transport.to_string(),
-                    option: option.id,
-                })
-            }
-        }
-        ApprovalDecision::Denied(_) => Err(ExecApprovalError::ApprovalDenied {
+        ApprovalDecision::Approved { .. } => Ok(()),
+        ApprovalDecision::ApprovedWithOption { .. } => Ok(()),
+        ApprovalDecision::Denied { .. } => Err(ExecApprovalError::ApprovalDenied {
             transport: request.transport.to_string(),
         }),
         ApprovalDecision::TimedOut => Err(ExecApprovalError::ApprovalTimedOut {
@@ -2519,10 +2518,9 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
     fn exec_runs_command_after_approval() {
         let seen_requests = Rc::new(RefCell::new(Vec::new()));
         let provider = TestApprovalProvider::new(
-            [Ok(ApprovalDecision::Approved(ApprovalGrantDecision::new(
-                "alice",
-                "2026-05-24T12:00:00Z",
-            )))],
+            [Ok(ApprovalDecision::Approved {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })],
             Rc::clone(&seen_requests),
         );
         let command_seen = Rc::new(RefCell::new(Vec::new()));
@@ -2610,10 +2608,9 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
     #[test]
     fn exec_fails_closed_when_approval_is_denied() {
         let provider = TestApprovalProvider::new(
-            [Ok(ApprovalDecision::Denied(ApprovalGrantDecision::new(
-                "alice",
-                "2026-05-24T12:00:00Z",
-            )))],
+            [Ok(ApprovalDecision::Denied {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })],
             Rc::new(RefCell::new(Vec::new())),
         );
 

@@ -780,6 +780,8 @@ name = "heim-approvals"
 version = "0.1.0"
 dependencies = [
  "heim-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
