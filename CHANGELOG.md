@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validated decision.
 - `heim exec` approval request preparation for JIT policy decisions, including
   configured transport options, while approval dispatch remains deferred.
+- `heim exec` daemon approval session creation for JIT policy decisions.
 - `heim exec` approval decision handling for approved, approved-with-option,
   denied, timed-out, and unavailable approval provider outcomes.
 - Approval options for provider-configured choices such as approving a request

@@ -145,13 +145,11 @@ Slack secrets live in `.auth.json`, not `config.toml`:
 }
 ```
 
-`heim exec` now dispatches JIT approval requests through the configured
-transport boundary. The built-in Slack provider validates the configured
-channel and bot token reference, then fails closed until the Slack API flow is
-implemented.
+`heim exec` now creates daemon sessions for JIT approval requests. A transport
+can later resolve the daemon session through the same approval decision model.
 
 ## Current Limitations
 
-`heim exec` still fails closed with the default runtime when a grant requires
-JIT approval because the built-in Slack provider does not call the Slack API
-yet. Slack API calls and real approval timeouts are intentionally deferred.
+`heim exec` still fails closed with the default runtime when a created daemon
+session remains pending because `approval_wait` is not implemented yet. Slack
+API calls and real approval timeouts are intentionally deferred.
