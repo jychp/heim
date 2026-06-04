@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   without overwriting existing files.
 - `heimd` local daemon skeleton with Unix socket `ping`/`pong` IPC for future
   long-lived approval workflows.
+- `heimd` in-memory approval session IPC for creating, reading, and deciding
+  approval sessions.
 - Core grant policy primitives for named grants, requester rules, command
   wildcards, and grant vs JIT approval modes.
 - Draft policy documentation and example policy configuration.
