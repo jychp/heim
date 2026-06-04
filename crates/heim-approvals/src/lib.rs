@@ -292,11 +292,7 @@ impl ApprovalDecision {
         match self {
             Self::Approved { .. } | Self::Denied { .. } | Self::TimedOut => Ok(()),
             Self::ApprovedWithOption { option, .. } => {
-                if request
-                    .options
-                    .iter()
-                    .any(|candidate| candidate.id == option.id)
-                {
+                if request.options.iter().any(|candidate| candidate == option) {
                     Ok(())
                 } else {
                     Err(ApprovalDecisionValidationError::UnconfiguredOption {
@@ -332,7 +328,7 @@ impl fmt::Display for ApprovalDecisionValidationError {
 impl std::error::Error for ApprovalDecisionValidationError {}
 
 /// Runtime approval session tracked while an approval request is pending.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApprovalSession {
     id: String,
     request: ApprovalRequest,
@@ -356,6 +352,28 @@ impl ApprovalSession {
             request,
             expires_at,
             status: ApprovalSessionStatus::Pending,
+        })
+    }
+
+    fn from_parts(
+        id: String,
+        request: ApprovalRequest,
+        expires_at: Option<String>,
+        status: ApprovalSessionStatus,
+    ) -> Result<Self, ApprovalSessionError> {
+        if id.is_empty() {
+            return Err(ApprovalSessionError::MissingSessionId);
+        }
+
+        status
+            .validate_for_request(&request)
+            .map_err(ApprovalSessionError::InvalidDecision)?;
+
+        Ok(Self {
+            id,
+            request,
+            expires_at,
+            status,
         })
     }
 
@@ -408,6 +426,25 @@ impl ApprovalSession {
     }
 }
 
+impl<'de> Deserialize<'de> for ApprovalSession {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ApprovalSessionWire {
+            id: String,
+            request: ApprovalRequest,
+            expires_at: Option<String>,
+            status: ApprovalSessionStatus,
+        }
+
+        let wire = ApprovalSessionWire::deserialize(deserializer)?;
+        Self::from_parts(wire.id, wire.request, wire.expires_at, wire.status)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Current state of an approval session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -425,6 +462,31 @@ pub enum ApprovalSessionStatus {
     },
     TimedOut,
     Expired,
+}
+
+impl ApprovalSessionStatus {
+    fn validate_for_request(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<(), ApprovalDecisionValidationError> {
+        match self {
+            Self::Pending
+            | Self::Approved { .. }
+            | Self::Denied { .. }
+            | Self::TimedOut
+            | Self::Expired => Ok(()),
+            Self::ApprovedWithOption { option, .. } => {
+                if request.options.iter().any(|candidate| candidate == option) {
+                    Ok(())
+                } else {
+                    Err(ApprovalDecisionValidationError::UnconfiguredOption {
+                        transport: request.transport.clone(),
+                        option: option.id.clone(),
+                    })
+                }
+            }
+        }
+    }
 }
 
 impl From<ApprovalDecision> for ApprovalSessionStatus {
@@ -867,6 +929,24 @@ mod tests {
     }
 
     #[test]
+    fn approval_decision_rejects_tampered_option_label() {
+        let request = approval_request_with_options();
+        let decision = ApprovalDecision::ApprovedWithOption {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            option: ApprovalOption::new("15m", "Approve 24h"),
+        };
+
+        let error = decision
+            .validate_for_request(&request)
+            .expect_err("mismatched option label");
+
+        assert_eq!(
+            error.to_string(),
+            "approval transport slack returned unconfigured option 15m"
+        );
+    }
+
+    #[test]
     fn approval_session_starts_pending() {
         let session = ApprovalSession::new(
             "session-1",
@@ -994,6 +1074,53 @@ mod tests {
             "approval transport slack returned unconfigured option 24h"
         );
         assert!(session.is_pending());
+    }
+
+    #[test]
+    fn approval_session_deserialize_rejects_missing_session_id() {
+        let mut session = ApprovalSession::new("session-1", approval_request_with_options(), None)
+            .expect("approval session");
+        session
+            .apply_decision(ApprovalDecision::Approved {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })
+            .expect("approval decision");
+        let mut value =
+            serde_json::to_value(&session).expect("approval session serialized as value");
+        value["id"] = serde_json::Value::String(String::new());
+
+        let error = serde_json::from_value::<ApprovalSession>(value)
+            .expect_err("missing session id rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("approval session id is required")
+        );
+    }
+
+    #[test]
+    fn approval_session_deserialize_rejects_tampered_option_label() {
+        let mut session = ApprovalSession::new("session-1", approval_request_with_options(), None)
+            .expect("approval session");
+        session
+            .apply_decision(ApprovalDecision::ApprovedWithOption {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                option: ApprovalOption::new("15m", "Approve 15m"),
+            })
+            .expect("approval decision");
+        let mut value =
+            serde_json::to_value(&session).expect("approval session serialized as value");
+        value["status"]["option"]["label"] = serde_json::Value::String("Approve 24h".to_owned());
+
+        let error = serde_json::from_value::<ApprovalSession>(value)
+            .expect_err("mismatched option label rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("approval transport slack returned unconfigured option 15m")
+        );
     }
 
     #[test]

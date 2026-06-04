@@ -45,7 +45,7 @@ transport-neutral approval request and decision contract.
 
 `heim-approvals` now defines the runtime approval session model that future
 daemon IPC messages will carry. A session wraps one approval request, an
-optional expiration timestamp, and a status.
+session id, optional expiration timestamp, and a status.
 
 The daemon does not store approval sessions yet. The intended next protocol
 extension is:

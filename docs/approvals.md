@@ -91,22 +91,23 @@ Session status starts as `pending`. A session can resolve to `approved`,
 `approved_with_option`, `denied`, `timed_out`, or `expired`.
 
 The session model validates decisions before applying them. In particular,
-`approved_with_option` is accepted only when the selected option id exists on
-the original request. Once a session is resolved, later decisions are rejected.
+`approved_with_option` is accepted only when the selected option matches one of
+the original request options. Once a session is resolved, later decisions are
+rejected.
 
 Requests, decisions, and sessions are serializable as JSON. Decision and status
 enums use a `type` field with snake-case values such as
 `approved_with_option`, `denied`, or `expired`. The approval transport name is
 serialized as the configured transport string, such as `slack`.
 
-This prepares the daemon workflow without making a transport-specific storage
-choice yet:
+This prepares the future daemon workflow without making a transport-specific
+storage choice yet:
 
 1. `heim exec` creates an approval request for a JIT policy decision.
-2. `heimd` creates a pending approval session.
+2. `heimd` will create a pending approval session.
 3. An approval transport presents the request to an approver.
 4. The transport sends back approve, deny, or approve-with-option.
-5. `heimd` resolves the session and `heim exec` applies the decision.
+5. `heimd` will resolve the session and `heim exec` will apply the decision.
 
 ## Transports
 
