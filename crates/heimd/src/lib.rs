@@ -248,7 +248,7 @@ impl fmt::Display for ApprovalSessionStoreError {
                 write!(formatter, "approval session {session_id} already exists")
             }
             Self::MissingSession { session_id } => {
-                write!(formatter, "approval session {session_id} was not found")
+                write!(formatter, "approval session {session_id} not found")
             }
             Self::Session(source) => write!(formatter, "{source}"),
         }
@@ -824,7 +824,7 @@ mod tests {
         assert!(matches!(
             response,
             DaemonResponse::Error { ref message }
-                if message == "approval session missing was not found"
+                if message == "approval session missing not found"
         ));
     }
 

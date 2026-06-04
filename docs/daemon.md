@@ -85,7 +85,7 @@ Decision response:
 Functional errors are returned as JSON responses:
 
 ```json
-{"type":"error","message":"approval session missing was not found"}
+{"type":"error","message":"approval session missing not found"}
 ```
 
 `approval_wait` and persistent session storage are intentionally deferred.
