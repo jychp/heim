@@ -17,6 +17,7 @@ use heim_approvals::{ApprovalDecision, ApprovalRequest, ApprovalSession, Approva
 use serde::{Deserialize, Serialize};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
+const MAX_ACTIVE_APPROVAL_WAITS: usize = 48;
 const INITIAL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +199,7 @@ pub enum DaemonResponse {
 #[serde(rename_all = "snake_case")]
 pub enum DaemonErrorCode {
     ApprovalWaitTimedOut,
+    ApprovalWaitLimitReached,
 }
 
 #[derive(Debug, Default)]
@@ -467,21 +469,22 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
     let _socket_file_guard = SocketFileGuard::new(socket);
     let state = Arc::new(SharedDaemonState::new());
     let connection_limit = Arc::new(ActiveConnectionLimit::new(MAX_ACTIVE_CONNECTIONS));
+    let wait_limit = Arc::new(ActiveConnectionLimit::new(MAX_ACTIVE_APPROVAL_WAITS));
 
     loop {
         let (stream, _) = listener
             .accept()
             .map_err(|source| DaemonError::AcceptConnection { source })?;
         if once {
-            if let Err(error) = handle_stream(&state, stream) {
+            if let Err(error) = handle_stream(&state, stream, None, &wait_limit) {
                 handle_connection_error(error, true)?;
             }
         } else {
             let state = Arc::clone(&state);
             let permit = Arc::clone(&connection_limit).acquire();
+            let wait_limit = Arc::clone(&wait_limit);
             std::thread::spawn(move || {
-                let _permit = permit;
-                if let Err(error) = handle_stream(&state, stream) {
+                if let Err(error) = handle_stream(&state, stream, Some(permit), &wait_limit) {
                     eprintln!("heimd: connection error: {error}");
                 }
             });
@@ -522,6 +525,17 @@ impl ActiveConnectionLimit {
         *active += 1;
         drop(active);
         ActiveConnectionPermit { limit: self }
+    }
+
+    fn try_acquire(self: Arc<Self>) -> Option<ActiveConnectionPermit> {
+        let mut active = self.active.lock().expect("connection limit lock poisoned");
+        if *active >= self.max {
+            return None;
+        }
+
+        *active += 1;
+        drop(active);
+        Some(ActiveConnectionPermit { limit: self })
     }
 
     fn release(&self) {
@@ -614,6 +628,8 @@ fn handle_connection_error(error: DaemonError, once: bool) -> Result<(), DaemonE
 fn handle_stream(
     state: &SharedDaemonState,
     stream: std::os::unix::net::UnixStream,
+    read_permit: Option<ActiveConnectionPermit>,
+    wait_limit: &Arc<ActiveConnectionLimit>,
 ) -> Result<(), DaemonError> {
     stream
         .set_read_timeout(Some(INITIAL_REQUEST_READ_TIMEOUT))
@@ -627,6 +643,28 @@ fn handle_stream(
         .read_line(&mut line)
         .map_err(|source| DaemonError::ReadConnection { source })?;
     let request = serde_json::from_str::<DaemonRequest>(&line).map_err(DaemonError::Parse)?;
+    drop(read_permit);
+
+    let _wait_permit = if matches!(request, DaemonRequest::ApprovalWait { .. }) {
+        match Arc::clone(wait_limit).try_acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let response = DaemonResponse::Error {
+                    message: "too many active approval_wait requests".to_owned(),
+                    code: Some(DaemonErrorCode::ApprovalWaitLimitReached),
+                };
+                let line = encode_response(&response)?;
+                let mut writer = stream;
+                writer
+                    .write_all(line.as_bytes())
+                    .map_err(|source| DaemonError::WriteConnection { source })?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     let response = handle_request(state, request);
     let line = encode_response(&response)?;
     let mut writer = stream;

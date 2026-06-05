@@ -1313,10 +1313,10 @@ fn apply_approval_requests_with_daemon(
         }
         let session = match client.wait_session(&session_id, APPROVAL_WAIT_TIMEOUT_MS) {
             Ok(session) => session,
-            Err(DaemonApprovalError::Daemon {
-                code: Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut),
-                ..
-            }) => {
+            Err(DaemonApprovalError::Daemon { message, code })
+                if code == Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut)
+                    || message == format!("approval session {session_id} wait timed out") =>
+            {
                 return Err(ExecApprovalError::ApprovalWaitTimedOut {
                     session: session_id,
                 });
@@ -2919,6 +2919,23 @@ options = ["15m", "60m"]
     }
 
     #[test]
+    fn exec_daemon_runtime_classifies_legacy_wait_timeout_message() {
+        let daemon = TestDaemonApprovalClient::pending_without_timeout_code();
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |_, _| {
+            panic!("command should not execute while approval is pending")
+        });
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval session test-request:slack wait timed out")
+        );
+    }
+
+    #[test]
     fn exec_daemon_runtime_runs_command_after_approval() {
         let daemon = TestDaemonApprovalClient::with_status(ApprovalSessionStatus::Approved {
             decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
@@ -3523,6 +3540,7 @@ options = ["15m", "60m"]
     struct TestDaemonApprovalClient {
         status: ApprovalSessionStatus,
         duplicate_on_create: bool,
+        wait_timeout_code: Option<heimd::DaemonErrorCode>,
         created: RefCell<Vec<String>>,
         waited: RefCell<Vec<String>>,
         requests: RefCell<Vec<ApprovalRequest>>,
@@ -3531,6 +3549,13 @@ options = ["15m", "60m"]
     impl TestDaemonApprovalClient {
         fn pending() -> Self {
             Self::with_status(ApprovalSessionStatus::Pending)
+        }
+
+        fn pending_without_timeout_code() -> Self {
+            Self {
+                wait_timeout_code: None,
+                ..Self::pending()
+            }
         }
 
         fn with_status(status: ApprovalSessionStatus) -> Self {
@@ -3545,6 +3570,7 @@ options = ["15m", "60m"]
             Self {
                 status,
                 duplicate_on_create,
+                wait_timeout_code: Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut),
                 created: RefCell::new(Vec::new()),
                 waited: RefCell::new(Vec::new()),
                 requests: RefCell::new(Vec::new()),
@@ -3584,7 +3610,7 @@ options = ["15m", "60m"]
             if self.status == ApprovalSessionStatus::Pending {
                 return Err(super::DaemonApprovalError::Daemon {
                     message: format!("approval session {session_id} wait timed out"),
-                    code: Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut),
+                    code: self.wait_timeout_code,
                 });
             }
 
