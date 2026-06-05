@@ -2914,6 +2914,31 @@ options = ["15m", "60m"]
     }
 
     #[test]
+    fn exec_daemon_runtime_runs_command_after_approval_with_option() {
+        let daemon =
+            TestDaemonApprovalClient::with_status(ApprovalSessionStatus::ApprovedWithOption {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                option: ApprovalOption::new("15m", "Approve 15m"),
+            });
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |command, _| {
+            *command_sink.borrow_mut() = command.to_vec();
+            super::CommandResult {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        });
+
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+    }
+
+    #[test]
     fn exec_daemon_runtime_uses_existing_resolved_session() {
         let daemon =
             TestDaemonApprovalClient::existing_with_status(ApprovalSessionStatus::Approved {
