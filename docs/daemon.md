@@ -52,6 +52,11 @@ It supports:
 - get an existing approval session
 - resolve a session with approve, deny, or approve-with-option
 
+`heim exec` uses this boundary for JIT grants. It creates a daemon session for
+each approval request, then reads the current session status. Approved and
+approve-with-option sessions allow the command to run. Denied, expired,
+timed-out, and still-pending sessions fail closed.
+
 Create request:
 
 ```json

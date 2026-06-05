@@ -50,12 +50,12 @@ heim approvals
 ```
 
 Only `doctor`, `init`, `config validate`, `policy validate`, `policy check`,
-`exec` policy preflight, approval request preparation, GitHub PAT environment
-injection for allowed `exec` requests, approval decision handling, allowed
-command execution, `audit list`, `heimd doctor`, `heimd serve`, `heimd ping`,
-`--help`, and `--version` are implemented today. The other commands are parsed
-and return an explicit "not implemented yet" error until their behavior is
-accepted.
+`exec` policy preflight, approval request preparation, daemon approval session
+creation, GitHub PAT environment injection for allowed `exec` requests,
+approval decision handling, allowed command execution, `audit list`, `heimd
+doctor`, `heimd serve`, `heimd ping`, `--help`, and `--version` are
+implemented today. The other commands are parsed and return an explicit "not
+implemented yet" error until their behavior is accepted.
 
 ## Grant Policy Model
 
@@ -73,11 +73,10 @@ Grant policies can express:
 
 Policy evaluation can drive local preflight and allowed command execution.
 When JIT approval is required, Heim prepares transport-neutral approval
-requests from the execution context and config. It can apply approval decisions
-returned by an approval provider. `heim-approvals` also models runtime approval
-sessions so a daemon can connect one request to one eventual decision. The
-built-in Slack provider validates runtime config and secrets, but Slack API
-dispatch is not implemented yet.
+requests from the execution context and config. `heim exec` creates daemon
+approval sessions and can apply resolved approval decisions. `heim-approvals`
+models runtime approval sessions so the daemon can connect one request to one
+eventual decision. Slack API dispatch is not implemented yet.
 
 Policy files are loaded from the platform config directory by default:
 
@@ -169,11 +168,11 @@ SDK credential chain and injects `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and configured region variables.
 The `github_app` issuer signs a GitHub App JWT, requests an installation token
 from GitHub, and injects the token into GitHub token variables. When approval is
-required, Heim loads config, validates the referenced approval transports, builds
-approval requests with configured options, and applies returned approval
-decisions. The default runtime still fails closed because no built-in approval
-transport calls Slack yet. Heim does not issue provider credentials until policy
-and approval allow the command.
+required, Heim loads config, validates the referenced approval transports,
+builds approval requests with configured options, and creates daemon approval
+sessions. The default runtime still fails closed while the session remains
+pending because `approval_wait` is not implemented yet. Heim does not issue
+provider credentials until policy and approval allow the command.
 
 Injected variables are scoped to the child process. If `GH_TOKEN` or
 `GITHUB_TOKEN` already exist in the parent environment, Heim's issued values

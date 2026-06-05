@@ -1,12 +1,14 @@
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{ffi::OsStr, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+#[cfg(test)]
+use heim_approvals::{ApprovalDecision, ApprovalError, ApprovalProvider};
 use heim_approvals::{
-    ApprovalDecision, ApprovalError, ApprovalGitContext, ApprovalGrant, ApprovalProvider,
-    ApprovalRequest, SlackApprovalProvider, SlackBotToken,
+    ApprovalGitContext, ApprovalGrant, ApprovalRequest, ApprovalSession, ApprovalSessionStatus,
 };
 use heim_core::{ApprovalMode, GrantPolicy};
 use heim_exec::{ExecutionPreflight, ExecutionRequest, evaluate_preflight};
@@ -15,7 +17,7 @@ use heim_providers::{
     AwsStsProvider, CredentialEnvVar, CredentialProvider, CredentialRequest, GithubAppProvider,
     GithubPatProvider, IssuedCredential, ProviderGitContext,
 };
-use heim_sources::{ProviderLocalSecrets, SecretKind, SecretSource, UnsafeLocalAuthSource};
+use heim_sources::{ProviderLocalSecrets, SecretSource, UnsafeLocalAuthSource};
 
 const NOT_IMPLEMENTED_EXIT_CODE: i32 = 2;
 const POLICY_DENIED_EXIT_CODE: i32 = 3;
@@ -1155,6 +1157,8 @@ enum ApprovalRuntime<'a> {
     BuiltIn(std::marker::PhantomData<&'a ()>),
     #[cfg(test)]
     Injected(&'a dyn ApprovalProvider),
+    #[cfg(test)]
+    InjectedDaemon(&'a dyn DaemonApprovalClient),
 }
 
 impl<'a> ApprovalRuntime<'a> {
@@ -1165,21 +1169,170 @@ impl<'a> ApprovalRuntime<'a> {
 
 fn apply_approval_requests(
     runtime: ApprovalRuntime<'_>,
-    config_source: &ConfigSource,
+    _config_source: &ConfigSource,
     requests: &[ApprovalRequest],
 ) -> Result<(), ExecApprovalError> {
     match runtime {
         ApprovalRuntime::BuiltIn(_) => {
-            let provider = RuntimeApprovalProvider::from_config_source(config_source, requests)?;
-            apply_approval_requests_with_provider(&provider, requests)
+            let client = RuntimeDaemonApprovalClient::from_default_socket()?;
+            apply_approval_requests_with_daemon(&client, requests)
         }
         #[cfg(test)]
         ApprovalRuntime::Injected(provider) => {
             apply_approval_requests_with_provider(provider, requests)
         }
+        #[cfg(test)]
+        ApprovalRuntime::InjectedDaemon(client) => {
+            apply_approval_requests_with_daemon(client, requests)
+        }
     }
 }
 
+trait DaemonApprovalClient {
+    fn create_session(
+        &self,
+        session_id: &str,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalSession, DaemonApprovalError>;
+
+    fn get_session(&self, session_id: &str) -> Result<ApprovalSession, DaemonApprovalError>;
+}
+
+struct RuntimeDaemonApprovalClient {
+    socket: PathBuf,
+}
+
+impl RuntimeDaemonApprovalClient {
+    fn from_default_socket() -> Result<Self, ExecApprovalError> {
+        let socket = heimd::default_socket_path().map_err(ExecApprovalError::DaemonPath)?;
+        Ok(Self { socket })
+    }
+
+    #[cfg(unix)]
+    fn send(
+        &self,
+        request: &heimd::DaemonRequest,
+    ) -> Result<heimd::DaemonResponse, DaemonApprovalError> {
+        use std::os::unix::net::UnixStream;
+
+        let mut stream =
+            UnixStream::connect(&self.socket).map_err(|source| DaemonApprovalError::Connect {
+                socket: self.socket.display().to_string(),
+                source,
+            })?;
+        let line = heimd::encode_request(request).map_err(DaemonApprovalError::Encode)?;
+        stream
+            .write_all(line.as_bytes())
+            .map_err(|source| DaemonApprovalError::Write {
+                socket: self.socket.display().to_string(),
+                source,
+            })?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .map_err(|source| DaemonApprovalError::Read {
+                socket: self.socket.display().to_string(),
+                source,
+            })?;
+        serde_json::from_str(&response).map_err(DaemonApprovalError::Decode)
+    }
+
+    #[cfg(not(unix))]
+    fn send(
+        &self,
+        _request: &heimd::DaemonRequest,
+    ) -> Result<heimd::DaemonResponse, DaemonApprovalError> {
+        Err(DaemonApprovalError::UnsupportedPlatform)
+    }
+}
+
+impl DaemonApprovalClient for RuntimeDaemonApprovalClient {
+    fn create_session(
+        &self,
+        session_id: &str,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalSession, DaemonApprovalError> {
+        let response = self.send(&heimd::DaemonRequest::ApprovalCreate {
+            session_id: session_id.to_owned(),
+            request: request.clone(),
+            expires_at: None,
+        })?;
+
+        match response {
+            heimd::DaemonResponse::ApprovalCreated { session } => Ok(session),
+            heimd::DaemonResponse::Error { message } => {
+                Err(DaemonApprovalError::Daemon { message })
+            }
+            other => Err(DaemonApprovalError::UnexpectedResponse {
+                response: format!("{other:?}"),
+            }),
+        }
+    }
+
+    fn get_session(&self, session_id: &str) -> Result<ApprovalSession, DaemonApprovalError> {
+        let response = self.send(&heimd::DaemonRequest::ApprovalGet {
+            session_id: session_id.to_owned(),
+        })?;
+
+        match response {
+            heimd::DaemonResponse::ApprovalSession { session } => Ok(session),
+            heimd::DaemonResponse::Error { message } => {
+                Err(DaemonApprovalError::Daemon { message })
+            }
+            other => Err(DaemonApprovalError::UnexpectedResponse {
+                response: format!("{other:?}"),
+            }),
+        }
+    }
+}
+
+fn apply_approval_requests_with_daemon(
+    client: &dyn DaemonApprovalClient,
+    requests: &[ApprovalRequest],
+) -> Result<(), ExecApprovalError> {
+    for request in requests {
+        let session_id = approval_session_id(request);
+        match client.create_session(&session_id, request) {
+            Ok(_) => {}
+            Err(DaemonApprovalError::Daemon { message })
+                if message == format!("approval session {session_id} already exists") => {}
+            Err(error) => return Err(ExecApprovalError::DaemonApproval(error)),
+        }
+        let session = client
+            .get_session(&session_id)
+            .map_err(ExecApprovalError::DaemonApproval)?;
+        validate_approval_session(&session)?;
+    }
+
+    Ok(())
+}
+
+fn approval_session_id(request: &ApprovalRequest) -> String {
+    format!("{}:{}", request.request_id, request.transport)
+}
+
+fn validate_approval_session(session: &ApprovalSession) -> Result<(), ExecApprovalError> {
+    match session.status() {
+        ApprovalSessionStatus::Pending => Err(ExecApprovalError::ApprovalPending {
+            session: session.id().to_owned(),
+        }),
+        ApprovalSessionStatus::Approved { .. } => Ok(()),
+        ApprovalSessionStatus::ApprovedWithOption { .. } => Ok(()),
+        ApprovalSessionStatus::Denied { .. } => Err(ExecApprovalError::ApprovalDenied {
+            transport: session.request().transport.to_string(),
+        }),
+        ApprovalSessionStatus::TimedOut => Err(ExecApprovalError::ApprovalTimedOut {
+            transport: session.request().transport.to_string(),
+        }),
+        ApprovalSessionStatus::Expired => Err(ExecApprovalError::ApprovalExpired {
+            session: session.id().to_owned(),
+        }),
+    }
+}
+
+#[cfg(test)]
 fn apply_approval_requests_with_provider(
     provider: &dyn ApprovalProvider,
     requests: &[ApprovalRequest],
@@ -1194,104 +1347,7 @@ fn apply_approval_requests_with_provider(
     Ok(())
 }
 
-struct RuntimeApprovalProvider {
-    transports: Vec<RuntimeApprovalTransport>,
-}
-
-impl RuntimeApprovalProvider {
-    fn from_config_source(
-        config_source: &ConfigSource,
-        requests: &[ApprovalRequest],
-    ) -> Result<Self, ExecApprovalError> {
-        let config = load_config_source(config_source).map_err(ExecApprovalError::LoadConfig)?;
-        let source = match &config_source.auth_file {
-            Some(auth_file) => UnsafeLocalAuthSource::load_file(auth_file),
-            None => UnsafeLocalAuthSource::load_default(),
-        }
-        .map_err(ExecApprovalError::ResolveSecret)?;
-        let transports = config
-            .approval_transports
-            .into_iter()
-            .filter(|transport| {
-                requests
-                    .iter()
-                    .any(|request| request.transport.as_str() == transport.name.as_str())
-            })
-            .map(|transport| RuntimeApprovalTransport::from_config(transport, &source))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(Self { transports })
-    }
-}
-
-impl ApprovalProvider for RuntimeApprovalProvider {
-    fn request_approval(
-        &self,
-        request: &ApprovalRequest,
-    ) -> Result<ApprovalDecision, ApprovalError> {
-        let Some(transport) = self
-            .transports
-            .iter()
-            .find(|transport| transport.name() == request.transport.as_str())
-        else {
-            return Err(ApprovalError::TransportUnavailable {
-                transport: request.transport.clone(),
-                message: "approval transport is not configured".to_owned(),
-            });
-        };
-
-        transport.request_approval(request)
-    }
-}
-
-enum RuntimeApprovalTransport {
-    Slack(SlackApprovalProvider),
-}
-
-impl RuntimeApprovalTransport {
-    fn from_config(
-        transport: heim_config::ApprovalTransportConfig,
-        source: &UnsafeLocalAuthSource,
-    ) -> Result<Self, ExecApprovalError> {
-        match transport.kind {
-            heim_config::ApprovalTransportKind::Slack { channel, bot_token } => {
-                let secret = source
-                    .resolve(&bot_token, SecretKind::SlackBotToken)
-                    .map_err(ExecApprovalError::ResolveSecret)?;
-                let heim_sources::ResolvedSecret::SlackBotToken { token } = secret else {
-                    return Err(ExecApprovalError::TransportSecretMismatch {
-                        transport: transport.name.to_string(),
-                    });
-                };
-                let bot_token =
-                    SlackBotToken::new(token).map_err(ExecApprovalError::SlackConfig)?;
-                let provider =
-                    SlackApprovalProvider::with_default_client(transport.name, channel, bot_token)
-                        .map_err(ExecApprovalError::SlackConfig)?;
-
-                Ok(Self::Slack(provider))
-            }
-        }
-    }
-
-    fn name(&self) -> &str {
-        match self {
-            Self::Slack(provider) => provider.transport_name().as_str(),
-        }
-    }
-}
-
-impl ApprovalProvider for RuntimeApprovalTransport {
-    fn request_approval(
-        &self,
-        request: &ApprovalRequest,
-    ) -> Result<ApprovalDecision, ApprovalError> {
-        match self {
-            Self::Slack(provider) => provider.request_approval(request),
-        }
-    }
-}
-
+#[cfg(test)]
 fn validate_approval_decision(
     request: &ApprovalRequest,
     decision: ApprovalDecision,
@@ -1519,27 +1575,49 @@ fn approval_grants_for_transport(
 #[derive(Debug)]
 enum ExecApprovalError {
     LoadConfig(heim_config::ConfigError),
-    ResolveSecret(heim_sources::SecretSourceError),
     BuildRequest(heim_approvals::ApprovalRequestBuildError),
+    #[cfg(test)]
     ApprovalProvider(heim_approvals::ApprovalError),
-    SlackConfig(heim_approvals::SlackApprovalConfigError),
-    MissingGrant { grant: String },
-    MissingProviderConfig { grant: String, provider: String },
-    MissingApprovalTransport { transport: String },
-    TransportSecretMismatch { transport: String },
-    ApprovalDenied { transport: String },
-    ApprovalTimedOut { transport: String },
-    UnconfiguredApprovalOption { transport: String, option: String },
+    DaemonPath(heimd::DaemonError),
+    DaemonApproval(DaemonApprovalError),
+    MissingGrant {
+        grant: String,
+    },
+    MissingProviderConfig {
+        grant: String,
+        provider: String,
+    },
+    MissingApprovalTransport {
+        transport: String,
+    },
+    ApprovalPending {
+        session: String,
+    },
+    ApprovalDenied {
+        transport: String,
+    },
+    ApprovalTimedOut {
+        transport: String,
+    },
+    ApprovalExpired {
+        session: String,
+    },
+    #[cfg(test)]
+    UnconfiguredApprovalOption {
+        transport: String,
+        option: String,
+    },
 }
 
 impl fmt::Display for ExecApprovalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LoadConfig(source) => write!(formatter, "{source}"),
-            Self::ResolveSecret(source) => write!(formatter, "{source}"),
             Self::BuildRequest(source) => write!(formatter, "{source}"),
+            #[cfg(test)]
             Self::ApprovalProvider(source) => write!(formatter, "{source}"),
-            Self::SlackConfig(source) => write!(formatter, "{source}"),
+            Self::DaemonPath(source) => write!(formatter, "{source}"),
+            Self::DaemonApproval(source) => write!(formatter, "{source}"),
             Self::MissingGrant { grant } => {
                 write!(
                     formatter,
@@ -1554,9 +1632,9 @@ impl fmt::Display for ExecApprovalError {
                 formatter,
                 "approval transport {transport} is required by policy but is not configured"
             ),
-            Self::TransportSecretMismatch { transport } => write!(
+            Self::ApprovalPending { session } => write!(
                 formatter,
-                "approval transport {transport} resolved an unexpected local secret"
+                "approval session {session} is pending; approval_wait is not implemented yet"
             ),
             Self::ApprovalDenied { transport } => {
                 write!(formatter, "approval request was denied by {transport}")
@@ -1564,6 +1642,10 @@ impl fmt::Display for ExecApprovalError {
             Self::ApprovalTimedOut { transport } => {
                 write!(formatter, "approval request timed out on {transport}")
             }
+            Self::ApprovalExpired { session } => {
+                write!(formatter, "approval session {session} expired")
+            }
+            #[cfg(test)]
             Self::UnconfiguredApprovalOption { transport, option } => write!(
                 formatter,
                 "approval transport {transport} returned unconfigured option {option}"
@@ -1576,17 +1658,96 @@ impl std::error::Error for ExecApprovalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LoadConfig(source) => Some(source),
-            Self::ResolveSecret(source) => Some(source),
             Self::BuildRequest(source) => Some(source),
+            #[cfg(test)]
             Self::ApprovalProvider(source) => Some(source),
-            Self::SlackConfig(source) => Some(source),
+            Self::DaemonPath(source) => Some(source),
+            Self::DaemonApproval(source) => Some(source),
             Self::MissingGrant { .. }
             | Self::MissingProviderConfig { .. }
             | Self::MissingApprovalTransport { .. }
-            | Self::TransportSecretMismatch { .. }
+            | Self::ApprovalPending { .. }
             | Self::ApprovalDenied { .. }
             | Self::ApprovalTimedOut { .. }
-            | Self::UnconfiguredApprovalOption { .. } => None,
+            | Self::ApprovalExpired { .. } => None,
+            #[cfg(test)]
+            Self::UnconfiguredApprovalOption { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DaemonApprovalError {
+    #[cfg(not(unix))]
+    UnsupportedPlatform,
+    Connect {
+        socket: String,
+        source: std::io::Error,
+    },
+    Write {
+        socket: String,
+        source: std::io::Error,
+    },
+    Read {
+        socket: String,
+        source: std::io::Error,
+    },
+    Encode(heimd::DaemonError),
+    Decode(serde_json::Error),
+    Daemon {
+        message: String,
+    },
+    UnexpectedResponse {
+        response: String,
+    },
+}
+
+impl fmt::Display for DaemonApprovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(not(unix))]
+            Self::UnsupportedPlatform => {
+                formatter.write_str("heimd approval IPC is not supported on this platform yet")
+            }
+            Self::Connect { socket, source } => {
+                write!(
+                    formatter,
+                    "failed to connect to heimd socket {socket}: {source}"
+                )
+            }
+            Self::Write { socket, source } => {
+                write!(
+                    formatter,
+                    "failed to write to heimd socket {socket}: {source}"
+                )
+            }
+            Self::Read { socket, source } => {
+                write!(
+                    formatter,
+                    "failed to read from heimd socket {socket}: {source}"
+                )
+            }
+            Self::Encode(source) => write!(formatter, "{source}"),
+            Self::Decode(source) => write!(formatter, "failed to decode heimd response: {source}"),
+            Self::Daemon { message } => write!(formatter, "{message}"),
+            Self::UnexpectedResponse { response } => {
+                write!(formatter, "unexpected heimd approval response: {response}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonApprovalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect { source, .. }
+            | Self::Write { source, .. }
+            | Self::Read { source, .. } => Some(source),
+            Self::Encode(source) => Some(source),
+            Self::Decode(source) => Some(source),
+            #[cfg(not(unix))]
+            Self::UnsupportedPlatform => None,
+            Self::Daemon { .. } | Self::UnexpectedResponse { .. } => None,
         }
     }
 }
@@ -1780,7 +1941,7 @@ mod tests {
 
     use heim_approvals::{
         ApprovalDecision, ApprovalError, ApprovalGrantDecision, ApprovalOption, ApprovalProvider,
-        ApprovalRequest,
+        ApprovalRequest, ApprovalSession, ApprovalSessionStatus,
     };
     use heim_audit::AuditDecision;
 
@@ -2648,7 +2809,7 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
     }
 
     #[test]
-    fn exec_runtime_dispatches_jit_requests_to_configured_slack_transport() {
+    fn exec_runtime_fails_closed_when_daemon_is_unavailable() {
         let policy = TestFile::new(
             "policy",
             r#"
@@ -2701,75 +2862,130 @@ options = ["15m", "60m"]
 
         assert_eq!(result.code, 6);
         assert!(result.stdout.is_empty());
-        assert!(
-            result
-                .stderr
-                .contains("approval transport slack is unavailable")
-        );
-        assert!(
-            result
-                .stderr
-                .contains("Slack approval dispatch is not implemented yet")
-        );
+        assert!(result.stderr.contains("failed to connect to heimd socket"));
     }
 
     #[test]
-    fn exec_runtime_fails_closed_when_slack_token_is_missing() {
-        let policy = TestFile::new(
-            "policy",
-            r#"
-[[grants]]
-name = "github.personal-readonly"
-provider = "github_personal"
-allow = ["gh"]
-commands = ["gh pr view *"]
-approval = "jit:slack"
-"#,
-        );
-        let config = TestFile::new(
-            "config",
-            r##"
-[providers.github_personal]
-type = "github_pat"
-token = { auth = "github_personal_pat" }
+    fn exec_daemon_runtime_fails_closed_when_session_is_pending() {
+        let daemon = TestDaemonApprovalClient::pending();
 
-[approval_transports.slack]
-type = "slack"
-channel = "#heim-approvals"
-bot_token = { auth = "missing_slack_bot_token" }
-"##,
-        );
-        let auth = TestFile::unsafe_auth_file();
-        let result = super::run_from_with_context_runtime(
-            [
-                "heim",
-                "exec",
-                "--file",
-                policy.path().to_str().expect("utf-8 path"),
-                "--config-file",
-                config.path().to_str().expect("utf-8 path"),
-                "--auth-file",
-                auth.path().to_str().expect("utf-8 path"),
-                "github.personal-readonly",
-                "--",
-                "gh",
-                "pr",
-                "view",
-                "42",
-            ],
-            || Ok("gh".to_owned()),
-            super::test_audit_context,
-            super::ApprovalRuntime::built_in(),
-            |_| Ok(()),
-            |_, _| panic!("command should not execute without Slack token"),
-        );
+        let result = run_jit_github_exec_with_daemon(&daemon, |_, _| {
+            panic!("command should not execute while approval is pending")
+        });
 
         assert_eq!(result.code, 6);
         assert!(result.stdout.is_empty());
         assert!(
             result
                 .stderr
-                .contains("unsafe local auth entry missing_slack_bot_token was not found")
+                .contains("approval session test-request:slack is pending")
+        );
+        assert_eq!(
+            daemon.created.borrow().as_slice(),
+            ["test-request:slack".to_owned()]
+        );
+        assert_eq!(
+            daemon.fetched.borrow().as_slice(),
+            ["test-request:slack".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exec_daemon_runtime_runs_command_after_approval() {
+        let daemon = TestDaemonApprovalClient::with_status(ApprovalSessionStatus::Approved {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+        });
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |command, _| {
+            *command_sink.borrow_mut() = command.to_vec();
+            super::CommandResult {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        });
+
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+    }
+
+    #[test]
+    fn exec_daemon_runtime_runs_command_after_approval_with_option() {
+        let daemon =
+            TestDaemonApprovalClient::with_status(ApprovalSessionStatus::ApprovedWithOption {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                option: ApprovalOption::new("15m", "Approve 15m"),
+            });
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |command, _| {
+            *command_sink.borrow_mut() = command.to_vec();
+            super::CommandResult {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        });
+
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+    }
+
+    #[test]
+    fn exec_daemon_runtime_uses_existing_resolved_session() {
+        let daemon =
+            TestDaemonApprovalClient::existing_with_status(ApprovalSessionStatus::Approved {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            });
+        let command_seen = Rc::new(RefCell::new(Vec::new()));
+        let command_sink = Rc::clone(&command_seen);
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |command, _| {
+            *command_sink.borrow_mut() = command.to_vec();
+            super::CommandResult {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        });
+
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert_eq!(
+            daemon.created.borrow().as_slice(),
+            ["test-request:slack".to_owned()]
+        );
+        assert_eq!(
+            daemon.fetched.borrow().as_slice(),
+            ["test-request:slack".to_owned()]
+        );
+        assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
+    }
+
+    #[test]
+    fn exec_daemon_runtime_fails_closed_when_denied() {
+        let daemon = TestDaemonApprovalClient::with_status(ApprovalSessionStatus::Denied {
+            decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+        });
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |_, _| {
+            panic!("command should not execute when daemon approval is denied")
+        });
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval request was denied by slack")
         );
     }
 
@@ -3185,6 +3401,65 @@ options = ["15m", "60m"]
         )
     }
 
+    fn run_jit_github_exec_with_daemon(
+        daemon: &dyn super::DaemonApprovalClient,
+        execute_command: impl FnOnce(
+            &[String],
+            &[heim_providers::CredentialEnvVar],
+        ) -> super::CommandResult,
+    ) -> super::CommandResult {
+        let policy = TestFile::new(
+            "policy",
+            r#"
+[[grants]]
+name = "github.personal-readonly"
+provider = "github_personal"
+allow = ["gh"]
+commands = ["gh pr view *"]
+approval = "jit:slack"
+"#,
+        );
+        let config = TestFile::new(
+            "config",
+            r##"
+[providers.github_personal]
+type = "github_pat"
+token = { auth = "github_personal_pat" }
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
+options = ["15m", "60m"]
+"##,
+        );
+        let auth = TestFile::unsafe_auth_file();
+
+        super::run_from_with_context_runtime(
+            [
+                "heim",
+                "exec",
+                "--file",
+                policy.path().to_str().expect("utf-8 path"),
+                "--config-file",
+                config.path().to_str().expect("utf-8 path"),
+                "--auth-file",
+                auth.path().to_str().expect("utf-8 path"),
+                "github.personal-readonly",
+                "--",
+                "gh",
+                "pr",
+                "view",
+                "42",
+            ],
+            || Ok("gh".to_owned()),
+            super::test_audit_context,
+            super::ApprovalRuntime::InjectedDaemon(daemon),
+            |_| Ok(()),
+            execute_command,
+        )
+    }
+
     struct TestApprovalProvider {
         decisions: RefCell<VecDeque<Result<ApprovalDecision, ApprovalError>>>,
         seen_requests: Rc<RefCell<Vec<String>>>,
@@ -3214,6 +3489,81 @@ options = ["15m", "60m"]
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(Ok(ApprovalDecision::TimedOut))
+        }
+    }
+
+    struct TestDaemonApprovalClient {
+        status: ApprovalSessionStatus,
+        duplicate_on_create: bool,
+        created: RefCell<Vec<String>>,
+        fetched: RefCell<Vec<String>>,
+        requests: RefCell<Vec<ApprovalRequest>>,
+    }
+
+    impl TestDaemonApprovalClient {
+        fn pending() -> Self {
+            Self::with_status(ApprovalSessionStatus::Pending)
+        }
+
+        fn with_status(status: ApprovalSessionStatus) -> Self {
+            Self::new(status, false)
+        }
+
+        fn existing_with_status(status: ApprovalSessionStatus) -> Self {
+            Self::new(status, true)
+        }
+
+        fn new(status: ApprovalSessionStatus, duplicate_on_create: bool) -> Self {
+            Self {
+                status,
+                duplicate_on_create,
+                created: RefCell::new(Vec::new()),
+                fetched: RefCell::new(Vec::new()),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl super::DaemonApprovalClient for TestDaemonApprovalClient {
+        fn create_session(
+            &self,
+            session_id: &str,
+            request: &ApprovalRequest,
+        ) -> Result<ApprovalSession, super::DaemonApprovalError> {
+            self.created.borrow_mut().push(session_id.to_owned());
+            self.requests.borrow_mut().push(request.clone());
+            if self.duplicate_on_create {
+                return Err(super::DaemonApprovalError::Daemon {
+                    message: format!("approval session {session_id} already exists"),
+                });
+            }
+
+            ApprovalSession::new(session_id, request.clone(), None).map_err(|source| {
+                super::DaemonApprovalError::Daemon {
+                    message: source.to_string(),
+                }
+            })
+        }
+
+        fn get_session(
+            &self,
+            session_id: &str,
+        ) -> Result<ApprovalSession, super::DaemonApprovalError> {
+            self.fetched.borrow_mut().push(session_id.to_owned());
+            let request = self
+                .requests
+                .borrow()
+                .last()
+                .cloned()
+                .expect("created request");
+            let mut value = serde_json::to_value(
+                ApprovalSession::new(session_id, request, None).expect("approval session"),
+            )
+            .expect("session json");
+            value["status"] = serde_json::to_value(&self.status).expect("status json");
+            serde_json::from_value(value).map_err(|source| super::DaemonApprovalError::Daemon {
+                message: source.to_string(),
+            })
         }
     }
 

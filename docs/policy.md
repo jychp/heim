@@ -198,11 +198,11 @@ wrapped command only.
 
 When any requested grant requires approval, Heim loads config, validates the
 referenced approval transport, builds one approval request per transport, and
-asks an approval provider for a decision. Approved decisions continue to
-credential issuance and command execution. Denied, timed-out, unavailable, or
+creates daemon approval sessions. Approved decisions continue to credential
+issuance and command execution. Denied, timed-out, unavailable, pending, or
 invalid approval decisions fail closed and do not start the wrapped command.
-The default runtime currently fails closed because built-in Slack dispatch does
-not call the Slack API yet. Denied policy requests return
+The default runtime currently fails closed while sessions remain pending
+because `approval_wait` is not implemented yet. Denied policy requests return
 the policy denial exit code and do not start the wrapped command.
 
 During preflight, Heim also builds a local execution context:

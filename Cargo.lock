@@ -806,6 +806,8 @@ dependencies = [
  "heim-policy",
  "heim-providers",
  "heim-sources",
+ "heimd",
+ "serde_json",
  "sysinfo",
 ]
 
