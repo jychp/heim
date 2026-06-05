@@ -698,6 +698,7 @@ impl std::error::Error for DaemonError {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
 
     use heim_approvals::{
@@ -1016,6 +1017,73 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn serve_forever_allows_wait_and_decide_on_separate_connections() {
+        let dir = TestDir::new("approval-wait-ipc");
+        let socket = dir.path().join("heimd.sock");
+        if !unix_socket_bind_is_supported(&socket) {
+            return;
+        }
+
+        let server_socket = socket.clone();
+        let _server = std::thread::spawn(move || {
+            super::serve_forever(&server_socket).expect("serve forever")
+        });
+
+        wait_for_socket(&socket);
+        let create_response = send_daemon_request(
+            &socket,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+        assert!(matches!(
+            create_response,
+            DaemonResponse::ApprovalCreated { .. }
+        ));
+
+        let wait_socket = socket.clone();
+        let waiter = std::thread::spawn(move || {
+            send_daemon_request(
+                &wait_socket,
+                DaemonRequest::ApprovalWait {
+                    session_id: "session-1".to_owned(),
+                    timeout_ms: 2_000,
+                },
+            )
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let decide_response = send_daemon_request(
+            &socket,
+            DaemonRequest::ApprovalDecide {
+                session_id: "session-1".to_owned(),
+                decision: ApprovalDecision::Approved {
+                    decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                },
+            },
+        );
+        assert!(matches!(
+            decide_response,
+            DaemonResponse::ApprovalDecided { .. }
+        ));
+
+        let wait_response = waiter.join().expect("waiter thread");
+        assert!(matches!(
+            wait_response,
+            DaemonResponse::ApprovalWaited { ref session }
+                if session.status()
+                    == &ApprovalSessionStatus::Approved {
+                        decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                    }
+        ));
+
+        drop(dir);
+    }
+
     #[test]
     fn daemon_rejects_invalid_approval_decision() {
         let state = SharedDaemonState::new();
@@ -1160,6 +1228,45 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_socket(socket: &std::path::Path) {
+        for _ in 0..100 {
+            if socket.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        panic!("daemon socket was not created");
+    }
+
+    #[cfg(unix)]
+    fn send_daemon_request(socket: &std::path::Path, request: DaemonRequest) -> DaemonResponse {
+        use std::os::unix::net::UnixStream;
+
+        let mut stream = UnixStream::connect(socket).expect("connect daemon socket");
+        let line = encode_request(&request).expect("request line");
+        stream.write_all(line.as_bytes()).expect("write request");
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response).expect("read response");
+        serde_json::from_str(&response).expect("daemon response")
+    }
+
+    #[cfg(unix)]
+    fn unix_socket_bind_is_supported(socket: &std::path::Path) -> bool {
+        match std::os::unix::net::UnixListener::bind(socket) {
+            Ok(listener) => {
+                drop(listener);
+                std::fs::remove_file(socket).expect("remove probe socket");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+            Err(error) => panic!("probe daemon socket bind failed: {error}"),
         }
     }
 
