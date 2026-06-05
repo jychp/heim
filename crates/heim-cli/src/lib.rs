@@ -1268,8 +1268,8 @@ impl DaemonApprovalClient for RuntimeDaemonApprovalClient {
 
         match response {
             heimd::DaemonResponse::ApprovalCreated { session } => Ok(session),
-            heimd::DaemonResponse::Error { message } => {
-                Err(DaemonApprovalError::Daemon { message })
+            heimd::DaemonResponse::Error { message, code } => {
+                Err(DaemonApprovalError::Daemon { message, code })
             }
             other => Err(DaemonApprovalError::UnexpectedResponse {
                 response: format!("{other:?}"),
@@ -1289,8 +1289,8 @@ impl DaemonApprovalClient for RuntimeDaemonApprovalClient {
 
         match response {
             heimd::DaemonResponse::ApprovalWaited { session } => Ok(session),
-            heimd::DaemonResponse::Error { message } => {
-                Err(DaemonApprovalError::Daemon { message })
+            heimd::DaemonResponse::Error { message, code } => {
+                Err(DaemonApprovalError::Daemon { message, code })
             }
             other => Err(DaemonApprovalError::UnexpectedResponse {
                 response: format!("{other:?}"),
@@ -1307,15 +1307,16 @@ fn apply_approval_requests_with_daemon(
         let session_id = approval_session_id(request);
         match client.create_session(&session_id, request) {
             Ok(_) => {}
-            Err(DaemonApprovalError::Daemon { message })
+            Err(DaemonApprovalError::Daemon { message, .. })
                 if message == format!("approval session {session_id} already exists") => {}
             Err(error) => return Err(ExecApprovalError::DaemonApproval(error)),
         }
         let session = match client.wait_session(&session_id, APPROVAL_WAIT_TIMEOUT_MS) {
             Ok(session) => session,
-            Err(DaemonApprovalError::Daemon { message })
-                if message == format!("approval session {session_id} wait timed out") =>
-            {
+            Err(DaemonApprovalError::Daemon {
+                code: Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut),
+                ..
+            }) => {
                 return Err(ExecApprovalError::ApprovalWaitTimedOut {
                     session: session_id,
                 });
@@ -1722,6 +1723,7 @@ enum DaemonApprovalError {
     Decode(serde_json::Error),
     Daemon {
         message: String,
+        code: Option<heimd::DaemonErrorCode>,
     },
     UnexpectedResponse {
         response: String,
@@ -1755,7 +1757,7 @@ impl fmt::Display for DaemonApprovalError {
             }
             Self::Encode(source) => write!(formatter, "{source}"),
             Self::Decode(source) => write!(formatter, "failed to decode heimd response: {source}"),
-            Self::Daemon { message } => write!(formatter, "{message}"),
+            Self::Daemon { message, .. } => write!(formatter, "{message}"),
             Self::UnexpectedResponse { response } => {
                 write!(formatter, "unexpected heimd approval response: {response}")
             }
@@ -3561,12 +3563,14 @@ options = ["15m", "60m"]
             if self.duplicate_on_create {
                 return Err(super::DaemonApprovalError::Daemon {
                     message: format!("approval session {session_id} already exists"),
+                    code: None,
                 });
             }
 
             ApprovalSession::new(session_id, request.clone(), None).map_err(|source| {
                 super::DaemonApprovalError::Daemon {
                     message: source.to_string(),
+                    code: None,
                 }
             })
         }
@@ -3580,6 +3584,7 @@ options = ["15m", "60m"]
             if self.status == ApprovalSessionStatus::Pending {
                 return Err(super::DaemonApprovalError::Daemon {
                     message: format!("approval session {session_id} wait timed out"),
+                    code: Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut),
                 });
             }
 
@@ -3596,6 +3601,7 @@ options = ["15m", "60m"]
             value["status"] = serde_json::to_value(&self.status).expect("status json");
             serde_json::from_value(value).map_err(|source| super::DaemonApprovalError::Daemon {
                 message: source.to_string(),
+                code: None,
             })
         }
     }

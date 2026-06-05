@@ -16,6 +16,9 @@ use clap::{Parser, Subcommand, error::ErrorKind};
 use heim_approvals::{ApprovalDecision, ApprovalRequest, ApprovalSession, ApprovalSessionStatus};
 use serde::{Deserialize, Serialize};
 
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
+const INITIAL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     pub code: i32,
@@ -172,11 +175,29 @@ pub enum DaemonRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
     Pong,
-    ApprovalCreated { session: ApprovalSession },
-    ApprovalSession { session: ApprovalSession },
-    ApprovalWaited { session: ApprovalSession },
-    ApprovalDecided { session: ApprovalSession },
-    Error { message: String },
+    ApprovalCreated {
+        session: ApprovalSession,
+    },
+    ApprovalSession {
+        session: ApprovalSession,
+    },
+    ApprovalWaited {
+        session: ApprovalSession,
+    },
+    ApprovalDecided {
+        session: ApprovalSession,
+    },
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<DaemonErrorCode>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonErrorCode {
+    ApprovalWaitTimedOut,
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +324,7 @@ fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonRe
                 Ok(session) => DaemonResponse::ApprovalCreated { session },
                 Err(error) => DaemonResponse::Error {
                     message: error.to_string(),
+                    code: None,
                 },
             };
             state.approvals_changed.notify_all();
@@ -313,6 +335,7 @@ fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonRe
                 Ok(session) => DaemonResponse::ApprovalSession { session },
                 Err(error) => DaemonResponse::Error {
                     message: error.to_string(),
+                    code: None,
                 },
             }
         }
@@ -328,6 +351,7 @@ fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonRe
                 Ok(session) => DaemonResponse::ApprovalDecided { session },
                 Err(error) => DaemonResponse::Error {
                     message: error.to_string(),
+                    code: None,
                 },
             };
             state.approvals_changed.notify_all();
@@ -355,6 +379,7 @@ fn handle_approval_wait(
             Err(error) => {
                 return DaemonResponse::Error {
                     message: error.to_string(),
+                    code: None,
                 };
             }
         }
@@ -363,6 +388,7 @@ fn handle_approval_wait(
         if now >= deadline {
             return DaemonResponse::Error {
                 message: format!("approval session {session_id} wait timed out"),
+                code: Some(DaemonErrorCode::ApprovalWaitTimedOut),
             };
         }
 
@@ -440,6 +466,7 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
     })?;
     let _socket_file_guard = SocketFileGuard::new(socket);
     let state = Arc::new(SharedDaemonState::new());
+    let connection_limit = Arc::new(ActiveConnectionLimit::new(MAX_ACTIVE_CONNECTIONS));
 
     loop {
         let (stream, _) = listener
@@ -451,7 +478,9 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
             }
         } else {
             let state = Arc::clone(&state);
+            let permit = Arc::clone(&connection_limit).acquire();
             std::thread::spawn(move || {
+                let _permit = permit;
                 if let Err(error) = handle_stream(&state, stream) {
                     eprintln!("heimd: connection error: {error}");
                 }
@@ -464,6 +493,53 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct ActiveConnectionLimit {
+    max: usize,
+    active: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl ActiveConnectionLimit {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            active: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: Arc<Self>) -> ActiveConnectionPermit {
+        let mut active = self.active.lock().expect("connection limit lock poisoned");
+        while *active >= self.max {
+            active = self
+                .changed
+                .wait(active)
+                .expect("connection limit lock poisoned");
+        }
+        *active += 1;
+        drop(active);
+        ActiveConnectionPermit { limit: self }
+    }
+
+    fn release(&self) {
+        let mut active = self.active.lock().expect("connection limit lock poisoned");
+        *active = active.saturating_sub(1);
+        self.changed.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct ActiveConnectionPermit {
+    limit: Arc<ActiveConnectionLimit>,
+}
+
+impl Drop for ActiveConnectionPermit {
+    fn drop(&mut self) {
+        self.limit.release();
+    }
 }
 
 #[cfg(unix)]
@@ -539,6 +615,9 @@ fn handle_stream(
     state: &SharedDaemonState,
     stream: std::os::unix::net::UnixStream,
 ) -> Result<(), DaemonError> {
+    stream
+        .set_read_timeout(Some(INITIAL_REQUEST_READ_TIMEOUT))
+        .map_err(|source| DaemonError::ConfigureConnection { source })?;
     let reader = stream
         .try_clone()
         .map_err(|source| DaemonError::CloneConnection { source })?;
@@ -628,6 +707,9 @@ pub enum DaemonError {
     CloneConnection {
         source: std::io::Error,
     },
+    ConfigureConnection {
+        source: std::io::Error,
+    },
     ReadConnection {
         source: std::io::Error,
     },
@@ -664,6 +746,9 @@ impl fmt::Display for DaemonError {
             Self::CloneConnection { source } => {
                 write!(formatter, "failed to clone daemon connection: {source}")
             }
+            Self::ConfigureConnection { source } => {
+                write!(formatter, "failed to configure daemon connection: {source}")
+            }
             Self::ReadConnection { source } => {
                 write!(formatter, "failed to read daemon connection: {source}")
             }
@@ -687,6 +772,7 @@ impl std::error::Error for DaemonError {
             | Self::ConnectSocket { source, .. }
             | Self::AcceptConnection { source }
             | Self::CloneConnection { source }
+            | Self::ConfigureConnection { source }
             | Self::ReadConnection { source }
             | Self::WriteConnection { source } => Some(source),
             Self::Serialize(source) | Self::Parse(source) => Some(source),
@@ -707,8 +793,8 @@ mod tests {
     };
 
     use super::{
-        DaemonRequest, DaemonResponse, SharedDaemonState, default_socket_path_from_env,
-        encode_request, encode_response, run_from,
+        DaemonErrorCode, DaemonRequest, DaemonResponse, SharedDaemonState,
+        default_socket_path_from_env, encode_request, encode_response, run_from,
     };
 
     #[test]
@@ -867,7 +953,7 @@ mod tests {
         assert!(matches!(first, DaemonResponse::ApprovalCreated { .. }));
         assert!(matches!(
             second,
-            DaemonResponse::Error { ref message }
+            DaemonResponse::Error { ref message, .. }
                 if message == "approval session session-1 already exists"
         ));
     }
@@ -1012,8 +1098,9 @@ mod tests {
 
         assert!(matches!(
             response,
-            DaemonResponse::Error { ref message }
+            DaemonResponse::Error { ref message, code }
                 if message == "approval session session-1 wait timed out"
+                    && code == Some(DaemonErrorCode::ApprovalWaitTimedOut)
         ));
     }
 
@@ -1109,7 +1196,7 @@ mod tests {
 
         assert!(matches!(
             response,
-            DaemonResponse::Error { ref message }
+            DaemonResponse::Error { ref message, .. }
                 if message == "approval transport slack returned unconfigured option 15m"
         ));
     }
@@ -1127,7 +1214,7 @@ mod tests {
 
         assert!(matches!(
             response,
-            DaemonResponse::Error { ref message }
+            DaemonResponse::Error { ref message, .. }
                 if message == "approval session missing not found"
         ));
     }
