@@ -9,9 +9,11 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
-use heim_approvals::{ApprovalDecision, ApprovalRequest, ApprovalSession};
+use heim_approvals::{ApprovalDecision, ApprovalRequest, ApprovalSession, ApprovalSessionStatus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +158,10 @@ pub enum DaemonRequest {
     ApprovalGet {
         session_id: String,
     },
+    ApprovalWait {
+        session_id: String,
+        timeout_ms: u64,
+    },
     ApprovalDecide {
         session_id: String,
         decision: ApprovalDecision,
@@ -168,6 +174,7 @@ pub enum DaemonResponse {
     Pong,
     ApprovalCreated { session: ApprovalSession },
     ApprovalSession { session: ApprovalSession },
+    ApprovalWaited { session: ApprovalSession },
     ApprovalDecided { session: ApprovalSession },
     Error { message: String },
 }
@@ -180,6 +187,22 @@ pub struct DaemonState {
 impl DaemonState {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedDaemonState {
+    state: Mutex<DaemonState>,
+    approvals_changed: Condvar,
+}
+
+impl SharedDaemonState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, DaemonState> {
+        self.state.lock().expect("daemon state lock poisoned")
     }
 }
 
@@ -264,35 +287,96 @@ impl std::error::Error for ApprovalSessionStoreError {
     }
 }
 
-fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResponse {
+fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
         DaemonRequest::ApprovalCreate {
             session_id,
             request,
             expires_at,
-        } => match state.approvals.create(session_id, request, expires_at) {
-            Ok(session) => DaemonResponse::ApprovalCreated { session },
-            Err(error) => DaemonResponse::Error {
-                message: error.to_string(),
-            },
-        },
-        DaemonRequest::ApprovalGet { session_id } => match state.approvals.get(&session_id) {
-            Ok(session) => DaemonResponse::ApprovalSession { session },
-            Err(error) => DaemonResponse::Error {
-                message: error.to_string(),
-            },
-        },
+        } => {
+            let response = match state
+                .lock()
+                .approvals
+                .create(session_id, request, expires_at)
+            {
+                Ok(session) => DaemonResponse::ApprovalCreated { session },
+                Err(error) => DaemonResponse::Error {
+                    message: error.to_string(),
+                },
+            };
+            state.approvals_changed.notify_all();
+            response
+        }
+        DaemonRequest::ApprovalGet { session_id } => {
+            match state.lock().approvals.get(&session_id) {
+                Ok(session) => DaemonResponse::ApprovalSession { session },
+                Err(error) => DaemonResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        DaemonRequest::ApprovalWait {
+            session_id,
+            timeout_ms,
+        } => handle_approval_wait(state, &session_id, Duration::from_millis(timeout_ms)),
         DaemonRequest::ApprovalDecide {
             session_id,
             decision,
-        } => match state.approvals.decide(&session_id, decision) {
-            Ok(session) => DaemonResponse::ApprovalDecided { session },
-            Err(error) => DaemonResponse::Error {
-                message: error.to_string(),
-            },
-        },
+        } => {
+            let response = match state.lock().approvals.decide(&session_id, decision) {
+                Ok(session) => DaemonResponse::ApprovalDecided { session },
+                Err(error) => DaemonResponse::Error {
+                    message: error.to_string(),
+                },
+            };
+            state.approvals_changed.notify_all();
+            response
+        }
     }
+}
+
+fn handle_approval_wait(
+    state: &SharedDaemonState,
+    session_id: &str,
+    timeout: Duration,
+) -> DaemonResponse {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let mut guard = state.lock();
+
+    loop {
+        match guard.approvals.get(session_id) {
+            Ok(session) if approval_session_is_resolved(session.status()) => {
+                return DaemonResponse::ApprovalWaited { session };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return DaemonResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return DaemonResponse::Error {
+                message: format!("approval session {session_id} wait timed out"),
+            };
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let (next_guard, _) = state
+            .approvals_changed
+            .wait_timeout(guard, remaining)
+            .expect("daemon state lock poisoned");
+        guard = next_guard;
+    }
+}
+
+fn approval_session_is_resolved(status: &ApprovalSessionStatus) -> bool {
+    !matches!(status, ApprovalSessionStatus::Pending)
 }
 
 pub fn encode_request(request: &DaemonRequest) -> Result<String, DaemonError> {
@@ -355,14 +439,23 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
         source,
     })?;
     let _socket_file_guard = SocketFileGuard::new(socket);
-    let mut state = DaemonState::new();
+    let state = Arc::new(SharedDaemonState::new());
 
     loop {
         let (stream, _) = listener
             .accept()
             .map_err(|source| DaemonError::AcceptConnection { source })?;
-        if let Err(error) = handle_stream(&mut state, stream) {
-            handle_connection_error(error, once)?;
+        if once {
+            if let Err(error) = handle_stream(&state, stream) {
+                handle_connection_error(error, true)?;
+            }
+        } else {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                if let Err(error) = handle_stream(&state, stream) {
+                    eprintln!("heimd: connection error: {error}");
+                }
+            });
         }
 
         if once {
@@ -443,7 +536,7 @@ fn handle_connection_error(error: DaemonError, once: bool) -> Result<(), DaemonE
 
 #[cfg(unix)]
 fn handle_stream(
-    state: &mut DaemonState,
+    state: &SharedDaemonState,
     stream: std::os::unix::net::UnixStream,
 ) -> Result<(), DaemonError> {
     let reader = stream
@@ -613,8 +706,8 @@ mod tests {
     };
 
     use super::{
-        DaemonRequest, DaemonResponse, DaemonState, default_socket_path_from_env, encode_request,
-        encode_response, run_from,
+        DaemonRequest, DaemonResponse, SharedDaemonState, default_socket_path_from_env,
+        encode_request, encode_response, run_from,
     };
 
     #[test]
@@ -679,6 +772,38 @@ mod tests {
     }
 
     #[test]
+    fn daemon_protocol_serializes_approval_wait_and_waited_response() {
+        let mut session = heim_approvals::ApprovalSession::new(
+            "session-1",
+            approval_request(),
+            Some("2026-05-24T12:15:00Z".to_owned()),
+        )
+        .expect("approval session");
+        session
+            .apply_decision(ApprovalDecision::Approved {
+                decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+            })
+            .expect("approval decision");
+        let request = encode_request(&DaemonRequest::ApprovalWait {
+            session_id: "session-1".to_owned(),
+            timeout_ms: 30_000,
+        })
+        .expect("request");
+        let response =
+            encode_response(&DaemonResponse::ApprovalWaited { session }).expect("response");
+        let request_value: serde_json::Value =
+            serde_json::from_str(request.trim()).expect("request json");
+        let response_value: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("response json");
+
+        assert_eq!(request_value["type"], "approval_wait");
+        assert_eq!(request_value["session_id"], "session-1");
+        assert_eq!(request_value["timeout_ms"], 30_000);
+        assert_eq!(response_value["type"], "approval_waited");
+        assert_eq!(response_value["session"]["status"]["type"], "approved");
+    }
+
+    #[test]
     fn default_socket_path_prefers_xdg_runtime_dir() {
         let path = default_socket_path_from_env(|name| match name {
             "XDG_RUNTIME_DIR" => Some(OsString::from("/tmp/runtime")),
@@ -691,18 +816,18 @@ mod tests {
 
     #[test]
     fn daemon_handles_ping_as_pong() {
-        let mut state = DaemonState::new();
-        let response = super::handle_request(&mut state, DaemonRequest::Ping);
+        let state = SharedDaemonState::new();
+        let response = super::handle_request(&state, DaemonRequest::Ping);
 
         assert_eq!(response, DaemonResponse::Pong);
     }
 
     #[test]
     fn daemon_creates_and_gets_approval_session() {
-        let mut state = DaemonState::new();
+        let state = SharedDaemonState::new();
 
         let create_response = super::handle_request(
-            &mut state,
+            &state,
             DaemonRequest::ApprovalCreate {
                 session_id: "session-1".to_owned(),
                 request: approval_request(),
@@ -710,7 +835,7 @@ mod tests {
             },
         );
         let get_response = super::handle_request(
-            &mut state,
+            &state,
             DaemonRequest::ApprovalGet {
                 session_id: "session-1".to_owned(),
             },
@@ -728,15 +853,15 @@ mod tests {
 
     #[test]
     fn daemon_rejects_duplicate_approval_session() {
-        let mut state = DaemonState::new();
+        let state = SharedDaemonState::new();
         let create = DaemonRequest::ApprovalCreate {
             session_id: "session-1".to_owned(),
             request: approval_request(),
             expires_at: None,
         };
 
-        let first = super::handle_request(&mut state, create.clone());
-        let second = super::handle_request(&mut state, create);
+        let first = super::handle_request(&state, create.clone());
+        let second = super::handle_request(&state, create);
 
         assert!(matches!(first, DaemonResponse::ApprovalCreated { .. }));
         assert!(matches!(
@@ -748,9 +873,9 @@ mod tests {
 
     #[test]
     fn daemon_decides_approval_session() {
-        let mut state = DaemonState::new();
+        let state = SharedDaemonState::new();
         let _ = super::handle_request(
-            &mut state,
+            &state,
             DaemonRequest::ApprovalCreate {
                 session_id: "session-1".to_owned(),
                 request: approval_request(),
@@ -759,7 +884,7 @@ mod tests {
         );
 
         let response = super::handle_request(
-            &mut state,
+            &state,
             DaemonRequest::ApprovalDecide {
                 session_id: "session-1".to_owned(),
                 decision: ApprovalDecision::ApprovedWithOption {
@@ -781,10 +906,94 @@ mod tests {
     }
 
     #[test]
-    fn daemon_rejects_invalid_approval_decision() {
-        let mut state = DaemonState::new();
+    fn daemon_wait_returns_resolved_approval_session() {
+        let state = SharedDaemonState::new();
         let _ = super::handle_request(
-            &mut state,
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+        let _ = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalDecide {
+                session_id: "session-1".to_owned(),
+                decision: ApprovalDecision::Approved {
+                    decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                },
+            },
+        );
+
+        let response = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalWait {
+                session_id: "session-1".to_owned(),
+                timeout_ms: 1,
+            },
+        );
+
+        assert!(matches!(
+            response,
+            DaemonResponse::ApprovalWaited { ref session }
+                if session.status()
+                    == &ApprovalSessionStatus::Approved {
+                        decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                    }
+        ));
+    }
+
+    #[test]
+    fn daemon_wait_returns_after_approval_decision() {
+        let state = std::sync::Arc::new(SharedDaemonState::new());
+        let _ = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+        let waiter_state = std::sync::Arc::clone(&state);
+
+        let waiter = std::thread::spawn(move || {
+            super::handle_request(
+                &waiter_state,
+                DaemonRequest::ApprovalWait {
+                    session_id: "session-1".to_owned(),
+                    timeout_ms: 2_000,
+                },
+            )
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalDecide {
+                session_id: "session-1".to_owned(),
+                decision: ApprovalDecision::Approved {
+                    decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                },
+            },
+        );
+
+        let response = waiter.join().expect("waiter thread");
+        assert!(matches!(
+            response,
+            DaemonResponse::ApprovalWaited { ref session }
+                if session.status()
+                    == &ApprovalSessionStatus::Approved {
+                        decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
+                    }
+        ));
+    }
+
+    #[test]
+    fn daemon_wait_times_out_while_session_is_pending() {
+        let state = SharedDaemonState::new();
+        let _ = super::handle_request(
+            &state,
             DaemonRequest::ApprovalCreate {
                 session_id: "session-1".to_owned(),
                 request: approval_request(),
@@ -793,7 +1002,34 @@ mod tests {
         );
 
         let response = super::handle_request(
-            &mut state,
+            &state,
+            DaemonRequest::ApprovalWait {
+                session_id: "session-1".to_owned(),
+                timeout_ms: 1,
+            },
+        );
+
+        assert!(matches!(
+            response,
+            DaemonResponse::Error { ref message }
+                if message == "approval session session-1 wait timed out"
+        ));
+    }
+
+    #[test]
+    fn daemon_rejects_invalid_approval_decision() {
+        let state = SharedDaemonState::new();
+        let _ = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+
+        let response = super::handle_request(
+            &state,
             DaemonRequest::ApprovalDecide {
                 session_id: "session-1".to_owned(),
                 decision: ApprovalDecision::ApprovedWithOption {
@@ -812,10 +1048,10 @@ mod tests {
 
     #[test]
     fn daemon_reports_missing_approval_session() {
-        let mut state = DaemonState::new();
+        let state = SharedDaemonState::new();
 
         let response = super::handle_request(
-            &mut state,
+            &state,
             DaemonRequest::ApprovalGet {
                 session_id: "missing".to_owned(),
             },

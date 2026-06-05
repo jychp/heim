@@ -50,12 +50,13 @@ It supports:
 
 - create a pending approval session from a JIT approval request
 - get an existing approval session
+- wait for a pending approval session to resolve
 - resolve a session with approve, deny, or approve-with-option
 
 `heim exec` uses this boundary for JIT grants. It creates a daemon session for
-each approval request, then reads the current session status. Approved and
-approve-with-option sessions allow the command to run. Denied, expired,
-timed-out, and still-pending sessions fail closed.
+each approval request, then waits for the current session status to resolve.
+Approved and approve-with-option sessions allow the command to run. Denied,
+expired, timed-out, unavailable, and wait-timeout sessions fail closed.
 
 Create request:
 
@@ -73,6 +74,18 @@ Get request:
 
 ```json
 {"type":"approval_get","session_id":"session-1"}
+```
+
+Wait request:
+
+```json
+{"type":"approval_wait","session_id":"session-1","timeout_ms":300000}
+```
+
+Wait response:
+
+```json
+{"type":"approval_waited","session":{"id":"session-1","request":{"request_id":"request-1","transport":"slack","grants":[{"name":"aws.prod-readonly","provider":"aws_prod"}],"requester":"codex","command":["aws","sts","get-caller-identity"],"cwd":"/workspace","git":null,"options":[{"id":"15m","label":"Approve 15m"}]},"expires_at":"2026-05-24T12:15:00Z","status":{"type":"approved_with_option","decision":{"approver":"alice","decided_at":"2026-05-24T12:00:00Z"},"option":{"id":"15m","label":"Approve 15m"}}}}
 ```
 
 Decision request:
@@ -93,6 +106,6 @@ Functional errors are returned as JSON responses:
 {"type":"error","message":"approval session missing not found"}
 ```
 
-`approval_wait` and persistent session storage are intentionally deferred.
-Slack Socket Mode and other asynchronous transports can build on this session
-boundary without changing the core approval request and decision schema.
+Persistent session storage is intentionally deferred. Slack Socket Mode and
+other asynchronous transports can build on this session boundary without
+changing the core approval request and decision schema.
