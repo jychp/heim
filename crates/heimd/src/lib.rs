@@ -257,11 +257,11 @@ impl SharedDaemonState {
 }
 
 #[derive(Debug)]
-struct ApprovalDispatchRuntime {
-    slack: Option<SlackApprovalRuntime<SlackSocketModeClient>>,
+struct ApprovalDispatchRuntime<C = SlackSocketModeClient> {
+    slack: Option<SlackApprovalRuntime<C>>,
 }
 
-impl ApprovalDispatchRuntime {
+impl ApprovalDispatchRuntime<SlackSocketModeClient> {
     fn from_sources(
         config_file: Option<PathBuf>,
         auth_file: Option<PathBuf>,
@@ -281,7 +281,12 @@ impl ApprovalDispatchRuntime {
             slack: SlackApprovalRuntime::from_config(&config, &source)?,
         })
     }
+}
 
+impl<C> ApprovalDispatchRuntime<C>
+where
+    C: SlackSocketModeApi + Clone + Send + Sync + 'static,
+{
     fn empty() -> Self {
         Self { slack: None }
     }
@@ -923,14 +928,17 @@ impl std::error::Error for ApprovalSessionStoreError {
 }
 
 fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonResponse {
-    handle_request_with_dispatch(state, request, None)
+    handle_request_with_dispatch::<SlackSocketModeClient>(state, request, None)
 }
 
-fn handle_request_with_dispatch(
+fn handle_request_with_dispatch<C>(
     state: &SharedDaemonState,
     request: DaemonRequest,
-    dispatch: Option<&ApprovalDispatchRuntime>,
-) -> DaemonResponse {
+    dispatch: Option<&ApprovalDispatchRuntime<C>>,
+) -> DaemonResponse
+where
+    C: SlackSocketModeApi + Clone + Send + Sync + 'static,
+{
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
         DaemonRequest::ApprovalCreate {
@@ -1727,20 +1735,37 @@ mod tests {
     #[test]
     fn slack_runtime_dispatches_matching_approval_session() {
         let client = RecordingSlackSocketModeClient::default();
-        let runtime = super::SlackApprovalRuntime::new(
-            client.clone(),
-            [super::SlackTransportRuntime {
-                name: "slack".to_owned(),
-                channel: "#heim-approvals".to_owned(),
-                bot_token: "xoxb-secret".to_owned(),
-                app_token: "xapp-secret".to_owned(),
-            }],
-        );
+        let runtime = test_slack_runtime(client.clone());
         let session = heim_approvals::ApprovalSession::new("session-1", approval_request(), None)
             .expect("session");
 
         runtime.dispatch_session(&session).expect("dispatch");
 
+        assert_eq!(
+            client.posts.lock().expect("posts").as_slice(),
+            [("slack".to_owned(), "session-1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn approval_create_dispatches_slack_session() {
+        let state = SharedDaemonState::new();
+        let client = RecordingSlackSocketModeClient::default();
+        let dispatch = super::ApprovalDispatchRuntime {
+            slack: Some(test_slack_runtime(client.clone())),
+        };
+
+        let response = super::handle_request_with_dispatch(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+            Some(&dispatch),
+        );
+
+        assert!(matches!(response, DaemonResponse::ApprovalCreated { .. }));
         assert_eq!(
             client.posts.lock().expect("posts").as_slice(),
             [("slack".to_owned(), "session-1".to_owned())]
@@ -2155,6 +2180,20 @@ mod tests {
         ) -> Result<(), super::SlackRuntimeError> {
             Ok(())
         }
+    }
+
+    fn test_slack_runtime(
+        client: RecordingSlackSocketModeClient,
+    ) -> super::SlackApprovalRuntime<RecordingSlackSocketModeClient> {
+        super::SlackApprovalRuntime::new(
+            client,
+            [super::SlackTransportRuntime {
+                name: "slack".to_owned(),
+                channel: "#heim-approvals".to_owned(),
+                bot_token: "xoxb-secret".to_owned(),
+                app_token: "xapp-secret".to_owned(),
+            }],
+        )
     }
 
     #[cfg(unix)]
