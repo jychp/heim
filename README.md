@@ -76,7 +76,7 @@ When JIT approval is required, Heim prepares transport-neutral approval
 requests from the execution context and config. `heim exec` creates daemon
 approval sessions and can apply resolved approval decisions. `heim-approvals`
 models runtime approval sessions so the daemon can connect one request to one
-eventual decision. Slack API dispatch is not implemented yet.
+eventual decision. `heimd` can dispatch Slack approvals through Socket Mode.
 
 Policy files are loaded from the platform config directory by default:
 
@@ -98,7 +98,7 @@ Provider configuration is loaded from the platform config directory:
 The config schema can model AWS STS, GitHub App, GitHub PAT providers, and
 approval transports such as Slack. Heim validates this schema and can issue a
 configured AWS STS session, GitHub App installation token, or GitHub PAT into
-an allowed child process. Built-in Slack API dispatch is not implemented yet.
+an allowed child process.
 
 Unsafe local auth entries can be stored in `<config>/heim/.auth.json`. This is
 supported but should be avoided for sensitive use when better sources are
@@ -184,8 +184,7 @@ override them for the wrapped command only.
 workflows such as Slack Socket Mode. The daemon stores approval sessions in
 memory and exposes JSONL IPC messages to create, read, and decide those
 sessions. It can also wait for a pending session to resolve. Persistent
-storage and Slack Socket Mode dispatch are deferred. The current daemon also
-exposes a health protocol:
+storage is deferred. The current daemon also exposes a health protocol:
 
 ```bash
 heimd doctor
@@ -222,7 +221,7 @@ Audit records must never contain credential secret values. `heim exec` emits one
 local audit event for the policy preflight decision and records redacted
 credential carrier metadata for issued GitHub App and GitHub PAT grants. It
 also records redacted metadata for issued AWS STS grants. It does not request
-approvals through the Slack API yet.
+approvals through non-Slack external systems yet.
 
 Local audit events can be listed with:
 

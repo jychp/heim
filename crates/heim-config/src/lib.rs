@@ -45,6 +45,7 @@ pub enum ApprovalTransportKind {
     Slack {
         channel: String,
         bot_token: LocalAuthRef,
+        app_token: Option<LocalAuthRef>,
     },
 }
 
@@ -208,6 +209,7 @@ pub enum LocalAuthSecret {
     GithubAppPrivateKey { pem: String },
     GithubPat { token: String },
     SlackBotToken { token: String },
+    SlackAppToken { token: String },
 }
 
 impl fmt::Debug for LocalAuthSecret {
@@ -223,6 +225,10 @@ impl fmt::Debug for LocalAuthSecret {
                 .finish(),
             Self::SlackBotToken { .. } => formatter
                 .debug_struct("SlackBotToken")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::SlackAppToken { .. } => formatter
+                .debug_struct("SlackAppToken")
                 .field("token", &"<redacted>")
                 .finish(),
         }
@@ -718,6 +724,7 @@ enum RawLocalAuthSecret {
     GithubAppPrivateKey { pem: String },
     GithubPat { token: String },
     SlackBotToken { token: String },
+    SlackAppToken { token: String },
 }
 
 impl TryFrom<RawHeimConfig> for HeimConfig {
@@ -909,6 +916,13 @@ fn convert_auth_secret(
             })
         }
         RawLocalAuthSecret::SlackBotToken { token } => Ok(LocalAuthSecret::SlackBotToken { token }),
+        RawLocalAuthSecret::SlackAppToken { token } if token.trim().is_empty() => {
+            Err(ConfigError::InvalidAuthSecret {
+                name: name.to_owned(),
+                message: "token is required".to_owned(),
+            })
+        }
+        RawLocalAuthSecret::SlackAppToken { token } => Ok(LocalAuthSecret::SlackAppToken { token }),
     }
 }
 
@@ -977,6 +991,7 @@ struct RawApprovalTransport {
     transport_type: String,
     channel: Option<String>,
     bot_token: Option<RawAuthRef>,
+    app_token: Option<RawAuthRef>,
     #[serde(default)]
     options: Vec<String>,
 }
@@ -1189,7 +1204,15 @@ fn convert_approval_transport(
                     message: "slack transport requires channel".to_owned(),
                 })?;
             let bot_token = convert_transport_auth_ref(&raw_name, "bot_token", raw.bot_token)?;
-            ApprovalTransportKind::Slack { channel, bot_token }
+            let app_token = raw
+                .app_token
+                .map(|value| convert_transport_auth_ref(&raw_name, "app_token", Some(value)))
+                .transpose()?;
+            ApprovalTransportKind::Slack {
+                channel,
+                bot_token,
+                app_token,
+            }
         }
         transport_type => {
             return Err(ConfigError::InvalidApprovalTransport {
@@ -1308,6 +1331,7 @@ token = { auth = "github_personal_pat" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 "##;
 
@@ -1364,7 +1388,10 @@ options = ["15m", "60m"]
             transport.kind,
             ApprovalTransportKind::Slack {
                 channel: "#heim-approvals".to_owned(),
-                bot_token: super::LocalAuthRef::new("slack_bot_token").expect("valid auth ref")
+                bot_token: super::LocalAuthRef::new("slack_bot_token").expect("valid auth ref"),
+                app_token: Some(
+                    super::LocalAuthRef::new("slack_app_token").expect("valid auth ref")
+                ),
             }
         );
         assert_eq!(transport.options[0].id, "15m");

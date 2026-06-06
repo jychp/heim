@@ -7,7 +7,8 @@ approval backend.
 The current implementation defines the contract in `heim-approvals`. `heim
 exec` can prepare approval requests from a JIT policy decision and configured
 transport options, then apply a decision returned by an approval provider. It
-does not call Slack or any external approval system yet.
+waits on daemon approval sessions, while `heimd` can dispatch Slack approvals
+through Socket Mode.
 
 ## Request
 
@@ -38,6 +39,7 @@ integration. `config.toml` uses the compact form:
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 ```
 
@@ -128,6 +130,7 @@ The transport itself lives in `config.toml`:
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 ```
 
@@ -141,6 +144,10 @@ Slack secrets live in `.auth.json`, not `config.toml`:
   "slack_bot_token": {
     "type": "slack_bot_token",
     "token": "xoxb-redacted"
+  },
+  "slack_app_token": {
+    "type": "slack_app_token",
+    "token": "xapp-redacted"
   }
 }
 ```
@@ -152,5 +159,5 @@ The default runtime waits for the daemon session to resolve before continuing.
 ## Current Limitations
 
 `heim exec` fails closed if a daemon approval session does not resolve before
-the local wait timeout. Slack API calls and policy-configured approval timeout
-values are intentionally deferred.
+the local wait timeout. Policy-configured approval timeout values are
+intentionally deferred.

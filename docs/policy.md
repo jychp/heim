@@ -128,12 +128,14 @@ The transport name references an approval transport in `config.toml`.
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 ```
 
 Transport configuration is intentionally separate from grants so Slack channel
 settings and auth references do not live in policy files. Slack secret values
-live in `.auth.json`.
+live in `.auth.json`. Slack Socket Mode requires both a bot token and an
+app-level token.
 
 `options` is optional. When present, each value becomes an approval option
 available to the transport. Heim maps `15m` to a default label of `Approve 15m`.

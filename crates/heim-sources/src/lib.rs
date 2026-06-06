@@ -15,6 +15,7 @@ pub enum SecretKind {
     GithubAppPrivateKey,
     GithubPat,
     SlackBotToken,
+    SlackAppToken,
 }
 
 impl fmt::Display for SecretKind {
@@ -23,6 +24,7 @@ impl fmt::Display for SecretKind {
             Self::GithubAppPrivateKey => formatter.write_str("github_app_private_key"),
             Self::GithubPat => formatter.write_str("github_pat"),
             Self::SlackBotToken => formatter.write_str("slack_bot_token"),
+            Self::SlackAppToken => formatter.write_str("slack_app_token"),
         }
     }
 }
@@ -33,6 +35,7 @@ pub enum ResolvedSecret {
     GithubAppPrivateKey { pem: String },
     GithubPat { token: String },
     SlackBotToken { token: String },
+    SlackAppToken { token: String },
 }
 
 impl ResolvedSecret {
@@ -41,11 +44,18 @@ impl ResolvedSecret {
             Self::GithubAppPrivateKey { .. } => SecretKind::GithubAppPrivateKey,
             Self::GithubPat { .. } => SecretKind::GithubPat,
             Self::SlackBotToken { .. } => SecretKind::SlackBotToken,
+            Self::SlackAppToken { .. } => SecretKind::SlackAppToken,
         }
     }
 
     pub fn slack_bot_token(token: impl Into<String>) -> Self {
         Self::SlackBotToken {
+            token: token.into(),
+        }
+    }
+
+    pub fn slack_app_token(token: impl Into<String>) -> Self {
+        Self::SlackAppToken {
             token: token.into(),
         }
     }
@@ -64,6 +74,10 @@ impl fmt::Debug for ResolvedSecret {
                 .finish(),
             Self::SlackBotToken { .. } => formatter
                 .debug_struct("SlackBotToken")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::SlackAppToken { .. } => formatter
+                .debug_struct("SlackAppToken")
                 .field("token", &"<redacted>")
                 .finish(),
         }
@@ -161,6 +175,9 @@ impl SecretSource for UnsafeLocalAuthSource {
                 token: token.clone(),
             },
             LocalAuthSecret::SlackBotToken { token } => ResolvedSecret::SlackBotToken {
+                token: token.clone(),
+            },
+            LocalAuthSecret::SlackAppToken { token } => ResolvedSecret::SlackAppToken {
                 token: token.clone(),
             },
         };
@@ -293,6 +310,26 @@ mod tests {
 
         assert_eq!(secret.kind(), SecretKind::SlackBotToken);
         assert!(!format!("{secret:?}").contains("xoxb-secret"));
+    }
+
+    #[test]
+    fn resolves_slack_app_token_from_unsafe_local_auth() {
+        let source = source_from_json(
+            r#"{
+                "slack_app_token": {
+                    "type": "slack_app_token",
+                    "token": "xapp-secret"
+                }
+            }"#,
+        );
+        let auth_ref = LocalAuthRef::new("slack_app_token").expect("valid auth ref");
+
+        let secret = source
+            .resolve(&auth_ref, SecretKind::SlackAppToken)
+            .expect("resolved secret");
+
+        assert_eq!(secret.kind(), SecretKind::SlackAppToken);
+        assert!(!format!("{secret:?}").contains("xapp-secret"));
     }
 
     #[test]

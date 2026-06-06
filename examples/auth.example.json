@@ -10,5 +10,9 @@
   "slack_bot_token": {
     "type": "slack_bot_token",
     "token": "xoxb-redacted"
+  },
+  "slack_app_token": {
+    "type": "slack_app_token",
+    "token": "xapp-redacted"
   }
 }

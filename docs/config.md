@@ -9,7 +9,7 @@ processes. It can also resolve a GitHub App private key, mint a GitHub App
 installation token, and inject that token into allowed `heim exec` child
 processes. It can issue AWS STS AssumeRole credentials for allowed commands
 through the AWS SDK credential chain. It can apply approval provider decisions,
-but the built-in Slack provider does not call the Slack API yet.
+and `heimd` can dispatch Slack approvals through Socket Mode.
 
 ## Config File
 
@@ -55,6 +55,7 @@ token = { auth = "github_personal_pat" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 ```
 
@@ -99,6 +100,7 @@ Required:
 
 - `channel`
 - `bot_token = { auth = "<entry>" }`
+- `app_token = { auth = "<entry>" }` for daemon Slack Socket Mode
 
 Optional:
 
@@ -108,8 +110,8 @@ Each option id is mapped to a default approval label. For example, `15m`
 becomes `Approve 15m`.
 
 The `bot_token` auth entry resolves to a Slack bot token in `.auth.json`. The
-runtime validates and loads this secret before dispatching approval requests,
-but the built-in Slack API flow is still not implemented.
+`app_token` auth entry resolves to a Slack app-level token used by Socket Mode.
+`heimd serve` loads both secrets before dispatching approval requests.
 
 Approval options are validated against the approval session. If a transport
 returns approve-with-option, the selected option id must exist in the original
@@ -189,6 +191,10 @@ Manager, or Infisical integrations when they are implemented.
   "slack_bot_token": {
     "type": "slack_bot_token",
     "token": "xoxb-redacted"
+  },
+  "slack_app_token": {
+    "type": "slack_app_token",
+    "token": "xapp-redacted"
   }
 }
 ```

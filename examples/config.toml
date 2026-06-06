@@ -25,4 +25,5 @@ token = { auth = "github_personal_pat" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
