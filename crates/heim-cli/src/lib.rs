@@ -800,6 +800,7 @@ duration = "15m"
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 "##;
 
@@ -2591,6 +2592,7 @@ private_key = { auth = "github_drymn_app_private_key" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 "##,
         );
@@ -2860,6 +2862,7 @@ token = { auth = "github_personal_pat" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 "##,
         );
@@ -3416,6 +3419,7 @@ token = { auth = "github_personal_pat" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 "##,
         );
@@ -3475,6 +3479,7 @@ token = { auth = "github_personal_pat" }
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "60m"]
 "##,
         );
@@ -3661,6 +3666,10 @@ options = ["15m", "60m"]
                     "slack_bot_token": {
                         "type": "slack_bot_token",
                         "token": "xoxb_secret"
+                    },
+                    "slack_app_token": {
+                        "type": "slack_app_token",
+                        "token": "xapp_secret"
                     }
                 }"#,
             );

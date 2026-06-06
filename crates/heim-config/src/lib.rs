@@ -45,7 +45,7 @@ pub enum ApprovalTransportKind {
     Slack {
         channel: String,
         bot_token: LocalAuthRef,
-        app_token: Option<LocalAuthRef>,
+        app_token: LocalAuthRef,
     },
 }
 
@@ -1204,10 +1204,7 @@ fn convert_approval_transport(
                     message: "slack transport requires channel".to_owned(),
                 })?;
             let bot_token = convert_transport_auth_ref(&raw_name, "bot_token", raw.bot_token)?;
-            let app_token = raw
-                .app_token
-                .map(|value| convert_transport_auth_ref(&raw_name, "app_token", Some(value)))
-                .transpose()?;
+            let app_token = convert_transport_auth_ref(&raw_name, "app_token", raw.app_token)?;
             ApprovalTransportKind::Slack {
                 channel,
                 bot_token,
@@ -1389,9 +1386,7 @@ options = ["15m", "60m"]
             ApprovalTransportKind::Slack {
                 channel: "#heim-approvals".to_owned(),
                 bot_token: super::LocalAuthRef::new("slack_bot_token").expect("valid auth ref"),
-                app_token: Some(
-                    super::LocalAuthRef::new("slack_app_token").expect("valid auth ref")
-                ),
+                app_token: super::LocalAuthRef::new("slack_app_token").expect("valid auth ref"),
             }
         );
         assert_eq!(transport.options[0].id, "15m");
@@ -1657,6 +1652,29 @@ channel = "#heim-approvals"
     }
 
     #[test]
+    fn rejects_slack_transport_without_app_token() {
+        let error = parse_config_str(
+            r##"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+
+[approval_transports.slack]
+type = "slack"
+channel = "#heim-approvals"
+bot_token = { auth = "slack_bot_token" }
+"##,
+        )
+        .expect_err("missing slack app token");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidApprovalTransport { .. }
+        ));
+        assert!(error.to_string().contains("app_token.auth is required"));
+    }
+
+    #[test]
     fn rejects_duplicate_approval_option_ids() {
         let error = parse_config_str(
             r##"
@@ -1668,6 +1686,7 @@ role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
 type = "slack"
 channel = "#heim-approvals"
 bot_token = { auth = "slack_bot_token" }
+app_token = { auth = "slack_app_token" }
 options = ["15m", "15m"]
 "##,
         )

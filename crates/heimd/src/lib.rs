@@ -1,7 +1,7 @@
 //! Local daemon for Heim approval workflows.
 //!
 //! `heimd` owns long-lived local IPC needed by interactive approval transports.
-//! Slack Socket Mode will build on this daemon boundary in a later change.
+//! Slack Socket Mode uses this daemon boundary to dispatch and resolve approvals.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -271,6 +271,11 @@ impl ApprovalDispatchRuntime<SlackSocketModeClient> {
             None => heim_config::load_default_config_file(),
         }
         .map_err(DaemonError::LoadConfig)?;
+
+        if config.approval_transports.is_empty() {
+            return Ok(Self::empty());
+        }
+
         let source = match auth_file {
             Some(path) => UnsafeLocalAuthSource::load_file(path),
             None => UnsafeLocalAuthSource::load_default(),
@@ -323,13 +328,6 @@ impl SlackApprovalRuntime<SlackSocketModeClient> {
                 bot_token,
                 app_token,
             } = &transport.kind;
-            let app_token =
-                app_token
-                    .as_ref()
-                    .ok_or_else(|| DaemonError::ApprovalDispatchConfig {
-                        transport: transport.name.to_string(),
-                        message: "slack transport requires app_token for Socket Mode".to_owned(),
-                    })?;
             let ResolvedSecret::SlackBotToken { token: bot_token } = source
                 .resolve(bot_token, SecretKind::SlackBotToken)
                 .map_err(DaemonError::ResolveSecret)?
@@ -404,8 +402,11 @@ where
             let client = self.client.clone();
             let state = Arc::clone(&state);
             std::thread::spawn(move || {
-                if let Err(error) = client.run_socket_mode(&transport, &state) {
-                    eprintln!("heimd: slack socket mode error: {error}");
+                loop {
+                    if let Err(error) = client.run_socket_mode(&transport, &state) {
+                        eprintln!("heimd: slack socket mode error: {error}");
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
                 }
             });
         }
@@ -962,10 +963,7 @@ where
                 (&response, dispatch)
                 && let Err(error) = dispatch.dispatch_session(session)
             {
-                return DaemonResponse::Error {
-                    message: error.to_string(),
-                    code: None,
-                };
+                eprintln!("heimd: approval dispatch failed: {error}");
             }
             response
         }
@@ -1773,6 +1771,58 @@ mod tests {
     }
 
     #[test]
+    fn approval_create_returns_created_when_slack_dispatch_fails() {
+        let state = SharedDaemonState::new();
+        let client = RecordingSlackSocketModeClient {
+            fail_posts: true,
+            ..Default::default()
+        };
+        let dispatch = super::ApprovalDispatchRuntime {
+            slack: Some(test_slack_runtime(client)),
+        };
+
+        let response = super::handle_request_with_dispatch(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+            Some(&dispatch),
+        );
+        let stored = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalGet {
+                session_id: "session-1".to_owned(),
+            },
+        );
+
+        assert!(matches!(response, DaemonResponse::ApprovalCreated { .. }));
+        assert!(matches!(stored, DaemonResponse::ApprovalSession { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_runtime_does_not_load_auth_without_approval_transports() {
+        let dir = TestDir::new("dispatch-no-transports");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+"#,
+        )
+        .expect("write config");
+
+        let runtime = super::ApprovalDispatchRuntime::from_sources(Some(config), None)
+            .expect("dispatch runtime");
+
+        assert!(runtime.slack.is_none());
+    }
+
+    #[test]
     fn slack_action_applies_approval_decision() {
         let state = SharedDaemonState::new();
         let _ = super::handle_request(
@@ -2158,6 +2208,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingSlackSocketModeClient {
         posts: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        fail_posts: bool,
     }
 
     impl super::SlackSocketModeApi for RecordingSlackSocketModeClient {
@@ -2166,6 +2217,11 @@ mod tests {
             transport: &super::SlackTransportRuntime,
             session: &heim_approvals::ApprovalSession,
         ) -> Result<(), super::SlackRuntimeError> {
+            if self.fail_posts {
+                return Err(super::SlackRuntimeError::Decision(
+                    "dispatch failed".to_owned(),
+                ));
+            }
             self.posts
                 .lock()
                 .expect("posts")
