@@ -1195,8 +1195,14 @@ trait DaemonApprovalClient {
         request: &ApprovalRequest,
     ) -> Result<ApprovalSession, DaemonApprovalError>;
 
-    fn get_session(&self, session_id: &str) -> Result<ApprovalSession, DaemonApprovalError>;
+    fn wait_session(
+        &self,
+        session_id: &str,
+        timeout_ms: u64,
+    ) -> Result<ApprovalSession, DaemonApprovalError>;
 }
+
+const APPROVAL_WAIT_TIMEOUT_MS: u64 = 300_000;
 
 struct RuntimeDaemonApprovalClient {
     socket: PathBuf,
@@ -1262,8 +1268,8 @@ impl DaemonApprovalClient for RuntimeDaemonApprovalClient {
 
         match response {
             heimd::DaemonResponse::ApprovalCreated { session } => Ok(session),
-            heimd::DaemonResponse::Error { message } => {
-                Err(DaemonApprovalError::Daemon { message })
+            heimd::DaemonResponse::Error { message, code } => {
+                Err(DaemonApprovalError::Daemon { message, code })
             }
             other => Err(DaemonApprovalError::UnexpectedResponse {
                 response: format!("{other:?}"),
@@ -1271,15 +1277,20 @@ impl DaemonApprovalClient for RuntimeDaemonApprovalClient {
         }
     }
 
-    fn get_session(&self, session_id: &str) -> Result<ApprovalSession, DaemonApprovalError> {
-        let response = self.send(&heimd::DaemonRequest::ApprovalGet {
+    fn wait_session(
+        &self,
+        session_id: &str,
+        timeout_ms: u64,
+    ) -> Result<ApprovalSession, DaemonApprovalError> {
+        let response = self.send(&heimd::DaemonRequest::ApprovalWait {
             session_id: session_id.to_owned(),
+            timeout_ms,
         })?;
 
         match response {
-            heimd::DaemonResponse::ApprovalSession { session } => Ok(session),
-            heimd::DaemonResponse::Error { message } => {
-                Err(DaemonApprovalError::Daemon { message })
+            heimd::DaemonResponse::ApprovalWaited { session } => Ok(session),
+            heimd::DaemonResponse::Error { message, code } => {
+                Err(DaemonApprovalError::Daemon { message, code })
             }
             other => Err(DaemonApprovalError::UnexpectedResponse {
                 response: format!("{other:?}"),
@@ -1296,13 +1307,22 @@ fn apply_approval_requests_with_daemon(
         let session_id = approval_session_id(request);
         match client.create_session(&session_id, request) {
             Ok(_) => {}
-            Err(DaemonApprovalError::Daemon { message })
+            Err(DaemonApprovalError::Daemon { message, .. })
                 if message == format!("approval session {session_id} already exists") => {}
             Err(error) => return Err(ExecApprovalError::DaemonApproval(error)),
         }
-        let session = client
-            .get_session(&session_id)
-            .map_err(ExecApprovalError::DaemonApproval)?;
+        let session = match client.wait_session(&session_id, APPROVAL_WAIT_TIMEOUT_MS) {
+            Ok(session) => session,
+            Err(DaemonApprovalError::Daemon { message, code })
+                if code == Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut)
+                    || message == format!("approval session {session_id} wait timed out") =>
+            {
+                return Err(ExecApprovalError::ApprovalWaitTimedOut {
+                    session: session_id,
+                });
+            }
+            Err(error) => return Err(ExecApprovalError::DaemonApproval(error)),
+        };
         validate_approval_session(&session)?;
     }
 
@@ -1593,6 +1613,9 @@ enum ExecApprovalError {
     ApprovalPending {
         session: String,
     },
+    ApprovalWaitTimedOut {
+        session: String,
+    },
     ApprovalDenied {
         transport: String,
     },
@@ -1634,8 +1657,11 @@ impl fmt::Display for ExecApprovalError {
             ),
             Self::ApprovalPending { session } => write!(
                 formatter,
-                "approval session {session} is pending; approval_wait is not implemented yet"
+                "approval session {session} is still pending after approval_wait"
             ),
+            Self::ApprovalWaitTimedOut { session } => {
+                write!(formatter, "approval session {session} wait timed out")
+            }
             Self::ApprovalDenied { transport } => {
                 write!(formatter, "approval request was denied by {transport}")
             }
@@ -1667,6 +1693,7 @@ impl std::error::Error for ExecApprovalError {
             | Self::MissingProviderConfig { .. }
             | Self::MissingApprovalTransport { .. }
             | Self::ApprovalPending { .. }
+            | Self::ApprovalWaitTimedOut { .. }
             | Self::ApprovalDenied { .. }
             | Self::ApprovalTimedOut { .. }
             | Self::ApprovalExpired { .. } => None,
@@ -1696,6 +1723,7 @@ enum DaemonApprovalError {
     Decode(serde_json::Error),
     Daemon {
         message: String,
+        code: Option<heimd::DaemonErrorCode>,
     },
     UnexpectedResponse {
         response: String,
@@ -1729,7 +1757,7 @@ impl fmt::Display for DaemonApprovalError {
             }
             Self::Encode(source) => write!(formatter, "{source}"),
             Self::Decode(source) => write!(formatter, "failed to decode heimd response: {source}"),
-            Self::Daemon { message } => write!(formatter, "{message}"),
+            Self::Daemon { message, .. } => write!(formatter, "{message}"),
             Self::UnexpectedResponse { response } => {
                 write!(formatter, "unexpected heimd approval response: {response}")
             }
@@ -2878,15 +2906,32 @@ options = ["15m", "60m"]
         assert!(
             result
                 .stderr
-                .contains("approval session test-request:slack is pending")
+                .contains("approval session test-request:slack wait timed out")
         );
         assert_eq!(
             daemon.created.borrow().as_slice(),
             ["test-request:slack".to_owned()]
         );
         assert_eq!(
-            daemon.fetched.borrow().as_slice(),
+            daemon.waited.borrow().as_slice(),
             ["test-request:slack".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exec_daemon_runtime_classifies_legacy_wait_timeout_message() {
+        let daemon = TestDaemonApprovalClient::pending_without_timeout_code();
+
+        let result = run_jit_github_exec_with_daemon(&daemon, |_, _| {
+            panic!("command should not execute while approval is pending")
+        });
+
+        assert_eq!(result.code, 6);
+        assert!(result.stdout.is_empty());
+        assert!(
+            result
+                .stderr
+                .contains("approval session test-request:slack wait timed out")
         );
     }
 
@@ -2964,7 +3009,7 @@ options = ["15m", "60m"]
             ["test-request:slack".to_owned()]
         );
         assert_eq!(
-            daemon.fetched.borrow().as_slice(),
+            daemon.waited.borrow().as_slice(),
             ["test-request:slack".to_owned()]
         );
         assert_eq!(command_seen.borrow().as_slice(), ["gh", "pr", "view", "42"]);
@@ -3495,14 +3540,22 @@ options = ["15m", "60m"]
     struct TestDaemonApprovalClient {
         status: ApprovalSessionStatus,
         duplicate_on_create: bool,
+        wait_timeout_code: Option<heimd::DaemonErrorCode>,
         created: RefCell<Vec<String>>,
-        fetched: RefCell<Vec<String>>,
+        waited: RefCell<Vec<String>>,
         requests: RefCell<Vec<ApprovalRequest>>,
     }
 
     impl TestDaemonApprovalClient {
         fn pending() -> Self {
             Self::with_status(ApprovalSessionStatus::Pending)
+        }
+
+        fn pending_without_timeout_code() -> Self {
+            Self {
+                wait_timeout_code: None,
+                ..Self::pending()
+            }
         }
 
         fn with_status(status: ApprovalSessionStatus) -> Self {
@@ -3517,8 +3570,9 @@ options = ["15m", "60m"]
             Self {
                 status,
                 duplicate_on_create,
+                wait_timeout_code: Some(heimd::DaemonErrorCode::ApprovalWaitTimedOut),
                 created: RefCell::new(Vec::new()),
-                fetched: RefCell::new(Vec::new()),
+                waited: RefCell::new(Vec::new()),
                 requests: RefCell::new(Vec::new()),
             }
         }
@@ -3535,21 +3589,31 @@ options = ["15m", "60m"]
             if self.duplicate_on_create {
                 return Err(super::DaemonApprovalError::Daemon {
                     message: format!("approval session {session_id} already exists"),
+                    code: None,
                 });
             }
 
             ApprovalSession::new(session_id, request.clone(), None).map_err(|source| {
                 super::DaemonApprovalError::Daemon {
                     message: source.to_string(),
+                    code: None,
                 }
             })
         }
 
-        fn get_session(
+        fn wait_session(
             &self,
             session_id: &str,
+            _timeout_ms: u64,
         ) -> Result<ApprovalSession, super::DaemonApprovalError> {
-            self.fetched.borrow_mut().push(session_id.to_owned());
+            self.waited.borrow_mut().push(session_id.to_owned());
+            if self.status == ApprovalSessionStatus::Pending {
+                return Err(super::DaemonApprovalError::Daemon {
+                    message: format!("approval session {session_id} wait timed out"),
+                    code: self.wait_timeout_code,
+                });
+            }
+
             let request = self
                 .requests
                 .borrow()
@@ -3563,6 +3627,7 @@ options = ["15m", "60m"]
             value["status"] = serde_json::to_value(&self.status).expect("status json");
             serde_json::from_value(value).map_err(|source| super::DaemonApprovalError::Daemon {
                 message: source.to_string(),
+                code: None,
             })
         }
     }

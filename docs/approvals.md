@@ -147,9 +147,10 @@ Slack secrets live in `.auth.json`, not `config.toml`:
 
 `heim exec` now creates daemon sessions for JIT approval requests. A transport
 can later resolve the daemon session through the same approval decision model.
+The default runtime waits for the daemon session to resolve before continuing.
 
 ## Current Limitations
 
-`heim exec` still fails closed with the default runtime when a created daemon
-session remains pending because `approval_wait` is not implemented yet. Slack
-API calls and real approval timeouts are intentionally deferred.
+`heim exec` fails closed if a daemon approval session does not resolve before
+the local wait timeout. Slack API calls and policy-configured approval timeout
+values are intentionally deferred.

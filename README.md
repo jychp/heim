@@ -170,9 +170,9 @@ The `github_app` issuer signs a GitHub App JWT, requests an installation token
 from GitHub, and injects the token into GitHub token variables. When approval is
 required, Heim loads config, validates the referenced approval transports,
 builds approval requests with configured options, and creates daemon approval
-sessions. The default runtime still fails closed while the session remains
-pending because `approval_wait` is not implemented yet. Heim does not issue
-provider credentials until policy and approval allow the command.
+sessions. The default runtime waits for the daemon session to resolve, then
+fails closed unless the session is approved. Heim does not issue provider
+credentials until policy and approval allow the command.
 
 Injected variables are scoped to the child process. If `GH_TOKEN` or
 `GITHUB_TOKEN` already exist in the parent environment, Heim's issued values
@@ -183,8 +183,9 @@ override them for the wrapped command only.
 `heimd` is the local daemon boundary for long-lived interactive approval
 workflows such as Slack Socket Mode. The daemon stores approval sessions in
 memory and exposes JSONL IPC messages to create, read, and decide those
-sessions. `approval_wait`, persistent storage, and Slack Socket Mode dispatch
-are deferred. The current daemon also exposes a health protocol:
+sessions. It can also wait for a pending session to resolve. Persistent
+storage and Slack Socket Mode dispatch are deferred. The current daemon also
+exposes a health protocol:
 
 ```bash
 heimd doctor

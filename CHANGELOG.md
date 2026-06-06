@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   long-lived approval workflows.
 - `heimd` in-memory approval session IPC for creating, reading, and deciding
   approval sessions.
+- `heimd` `approval_wait` IPC for waiting on pending approval sessions.
 - Core grant policy primitives for named grants, requester rules, command
   wildcards, and grant vs JIT approval modes.
 - Draft policy documentation and example policy configuration.
@@ -40,6 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `heim exec` approval request preparation for JIT policy decisions, including
   configured transport options, while approval dispatch remains deferred.
 - `heim exec` daemon approval session creation for JIT policy decisions.
+- `heim exec` daemon approval waiting for JIT policy decisions.
 - `heim exec` approval decision handling for approved, approved-with-option,
   denied, timed-out, and unavailable approval provider outcomes.
 - Approval options for provider-configured choices such as approving a request
