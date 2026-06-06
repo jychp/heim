@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `heimd` in-memory approval session IPC for creating, reading, and deciding
   approval sessions.
 - `heimd` `approval_wait` IPC for waiting on pending approval sessions.
+- `heimd` Slack Socket Mode dispatch for JIT approval sessions.
 - Core grant policy primitives for named grants, requester rules, command
   wildcards, and grant vs JIT approval modes.
 - Draft policy documentation and example policy configuration.
@@ -48,8 +49,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   for a specific duration.
 - Policy loading for approval transport options using compact TOML arrays.
 - Runtime approval transport dispatch with a Slack provider boundary that loads
-  Slack bot tokens from unsafe local auth and fails closed until Slack API
-  calls are implemented.
+  Slack bot tokens from unsafe local auth.
+- Slack app token auth entries for daemon Socket Mode approval dispatch.
 - Provider configuration schema for future AWS STS, GitHub App, and GitHub PAT
   credential issuance.
 - Unsafe local auth file schema for GitHub App private keys and GitHub PATs,

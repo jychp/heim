@@ -1,11 +1,10 @@
 # Local Daemon
 
-`heimd` is the local daemon boundary for long-lived approval workflows. It is
-required for future transports that need to receive asynchronous decisions, such
-as Slack Socket Mode.
+`heimd` is the local daemon boundary for long-lived approval workflows. It
+receives asynchronous decisions from transports such as Slack Socket Mode.
 
-The current daemon implements a local JSONL IPC protocol for health checks and
-in-memory approval sessions:
+The current daemon implements Slack Socket Mode dispatch and a local JSONL IPC
+protocol for health checks and in-memory approval sessions:
 
 ```bash
 heimd doctor
@@ -106,6 +105,6 @@ Functional errors are returned as JSON responses:
 {"type":"error","message":"approval session missing not found"}
 ```
 
-Persistent session storage is intentionally deferred. Slack Socket Mode and
-other asynchronous transports can build on this session boundary without
-changing the core approval request and decision schema.
+Persistent session storage is intentionally deferred. Other asynchronous
+transports can build on this session boundary without changing the core
+approval request and decision schema.

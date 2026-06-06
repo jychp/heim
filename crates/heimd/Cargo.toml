@@ -11,8 +11,11 @@ rust-version.workspace = true
 clap = { version = "4.5.53", features = ["derive"] }
 heim-approvals = { version = "0.1.0", path = "../heim-approvals" }
 heim-config = { version = "0.1.0", path = "../heim-config" }
+heim-sources = { version = "0.1.0", path = "../heim-sources" }
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+tungstenite = { version = "0.29.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 [[bin]]
 name = "heimd"

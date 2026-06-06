@@ -1,7 +1,7 @@
 //! Local daemon for Heim approval workflows.
 //!
 //! `heimd` owns long-lived local IPC needed by interactive approval transports.
-//! Slack Socket Mode will build on this daemon boundary in a later change.
+//! Slack Socket Mode uses this daemon boundary to dispatch and resolve approvals.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -13,7 +13,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
-use heim_approvals::{ApprovalDecision, ApprovalRequest, ApprovalSession, ApprovalSessionStatus};
+use heim_approvals::{
+    ApprovalDecision, ApprovalGrantDecision, ApprovalOption, ApprovalRequest, ApprovalSession,
+    ApprovalSessionStatus,
+};
+use heim_sources::{ResolvedSecret, SecretKind, SecretSource, UnsafeLocalAuthSource};
 use serde::{Deserialize, Serialize};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
@@ -48,6 +52,14 @@ enum Command {
         /// Socket path to bind instead of the default path.
         #[arg(long)]
         socket: Option<PathBuf>,
+
+        /// Config file to load approval transports from.
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+
+        /// Unsafe local auth file to resolve approval transport secrets from.
+        #[arg(long)]
+        auth_file: Option<PathBuf>,
 
         /// Handle one request and exit.
         #[arg(long)]
@@ -93,13 +105,23 @@ where
 fn run(cli: Cli) -> CommandResult {
     match cli.command {
         Some(Command::Doctor) => ok("heimd: ok\n"),
-        Some(Command::Serve { socket, once }) => run_serve(socket, once),
+        Some(Command::Serve {
+            socket,
+            config_file,
+            auth_file,
+            once,
+        }) => run_serve(socket, config_file, auth_file, once),
         Some(Command::Ping { socket }) => run_ping(socket),
         None => ok("heimd: ok\n"),
     }
 }
 
-fn run_serve(socket: Option<PathBuf>, once: bool) -> CommandResult {
+fn run_serve(
+    socket: Option<PathBuf>,
+    config_file: Option<PathBuf>,
+    auth_file: Option<PathBuf>,
+    once: bool,
+) -> CommandResult {
     let socket = match socket.or_else(|| default_socket_path().ok()) {
         Some(socket) => socket,
         None => {
@@ -107,10 +129,15 @@ fn run_serve(socket: Option<PathBuf>, once: bool) -> CommandResult {
         }
     };
 
+    let dispatch = match ApprovalDispatchRuntime::from_sources(config_file, auth_file) {
+        Ok(dispatch) => dispatch,
+        Err(error) => return command_error(2, format!("{error}\n")),
+    };
+
     let result = if once {
-        serve_once(&socket)
+        serve_once_with_dispatch(&socket, dispatch)
     } else {
-        serve_forever(&socket)
+        serve_forever_with_dispatch(&socket, dispatch)
     };
 
     match result {
@@ -229,6 +256,597 @@ impl SharedDaemonState {
     }
 }
 
+#[derive(Debug)]
+struct ApprovalDispatchRuntime<C = SlackSocketModeClient> {
+    slack: Option<SlackApprovalRuntime<C>>,
+}
+
+impl ApprovalDispatchRuntime<SlackSocketModeClient> {
+    fn from_sources(
+        config_file: Option<PathBuf>,
+        auth_file: Option<PathBuf>,
+    ) -> Result<Self, DaemonError> {
+        let config = match config_file {
+            Some(path) => heim_config::load_config_file(path),
+            None => heim_config::load_default_config_file(),
+        }
+        .map_err(DaemonError::LoadConfig)?;
+
+        if config.approval_transports.is_empty() {
+            return Ok(Self::empty());
+        }
+
+        let source = match auth_file {
+            Some(path) => UnsafeLocalAuthSource::load_file(path),
+            None => UnsafeLocalAuthSource::load_default(),
+        }
+        .map_err(DaemonError::ResolveSecret)?;
+
+        Ok(Self {
+            slack: SlackApprovalRuntime::from_config(&config, &source)?,
+        })
+    }
+}
+
+impl<C> ApprovalDispatchRuntime<C>
+where
+    C: SlackSocketModeApi + Clone + Send + Sync + 'static,
+{
+    fn empty() -> Self {
+        Self { slack: None }
+    }
+
+    fn dispatch_session(&self, session: &ApprovalSession) -> Result<(), DaemonError> {
+        if let Some(slack) = &self.slack {
+            slack.dispatch_session(session)?;
+        }
+        Ok(())
+    }
+
+    fn start_socket_mode(&self, state: Arc<SharedDaemonState>) {
+        if let Some(slack) = &self.slack {
+            slack.start_socket_mode(state);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SlackApprovalRuntime<C> {
+    client: C,
+    transports: Arc<BTreeMap<String, SlackTransportRuntime>>,
+}
+
+impl SlackApprovalRuntime<SlackSocketModeClient> {
+    fn from_config(
+        config: &heim_config::HeimConfig,
+        source: &dyn SecretSource,
+    ) -> Result<Option<Self>, DaemonError> {
+        let mut transports = BTreeMap::new();
+        for transport in &config.approval_transports {
+            let heim_config::ApprovalTransportKind::Slack {
+                channel,
+                bot_token,
+                app_token,
+            } = &transport.kind;
+            let ResolvedSecret::SlackBotToken { token: bot_token } = source
+                .resolve(bot_token, SecretKind::SlackBotToken)
+                .map_err(DaemonError::ResolveSecret)?
+            else {
+                return Err(DaemonError::ApprovalDispatchConfig {
+                    transport: transport.name.to_string(),
+                    message: "bot_token did not resolve to a Slack bot token".to_owned(),
+                });
+            };
+            let ResolvedSecret::SlackAppToken { token: app_token } = source
+                .resolve(app_token, SecretKind::SlackAppToken)
+                .map_err(DaemonError::ResolveSecret)?
+            else {
+                return Err(DaemonError::ApprovalDispatchConfig {
+                    transport: transport.name.to_string(),
+                    message: "app_token did not resolve to a Slack app token".to_owned(),
+                });
+            };
+            transports.insert(
+                transport.name.to_string(),
+                SlackTransportRuntime {
+                    name: transport.name.to_string(),
+                    channel: channel.clone(),
+                    bot_token,
+                    app_token,
+                },
+            );
+        }
+
+        if transports.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            client: SlackSocketModeClient::new(),
+            transports: Arc::new(transports),
+        }))
+    }
+}
+
+impl<C> SlackApprovalRuntime<C>
+where
+    C: SlackSocketModeApi + Clone + Send + Sync + 'static,
+{
+    #[cfg(test)]
+    #[cfg(test)]
+    fn new(client: C, transports: impl IntoIterator<Item = SlackTransportRuntime>) -> Self {
+        Self {
+            client,
+            transports: Arc::new(
+                transports
+                    .into_iter()
+                    .map(|transport| (transport.name.clone(), transport))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn dispatch_session(&self, session: &ApprovalSession) -> Result<(), DaemonError> {
+        let Some(transport) = self.transports.get(session.request().transport.as_str()) else {
+            return Ok(());
+        };
+
+        self.client
+            .post_approval_request(transport, session)
+            .map_err(DaemonError::Slack)
+    }
+
+    fn start_socket_mode(&self, state: Arc<SharedDaemonState>) {
+        let transports = self.transports.values().cloned().collect::<Vec<_>>();
+        for transport in transports {
+            let client = self.client.clone();
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                loop {
+                    if let Err(error) = client.run_socket_mode(&transport, &state) {
+                        eprintln!("heimd: slack socket mode error: {error}");
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackTransportRuntime {
+    name: String,
+    channel: String,
+    bot_token: String,
+    app_token: String,
+}
+
+trait SlackSocketModeApi {
+    fn post_approval_request(
+        &self,
+        transport: &SlackTransportRuntime,
+        session: &ApprovalSession,
+    ) -> Result<(), SlackRuntimeError>;
+
+    fn run_socket_mode(
+        &self,
+        transport: &SlackTransportRuntime,
+        state: &SharedDaemonState,
+    ) -> Result<(), SlackRuntimeError>;
+}
+
+#[derive(Debug, Clone)]
+struct SlackSocketModeClient {
+    http: reqwest::blocking::Client,
+}
+
+impl SlackSocketModeClient {
+    fn new() -> Self {
+        Self {
+            http: reqwest::blocking::Client::new(),
+        }
+    }
+}
+
+impl SlackSocketModeApi for SlackSocketModeClient {
+    fn post_approval_request(
+        &self,
+        transport: &SlackTransportRuntime,
+        session: &ApprovalSession,
+    ) -> Result<(), SlackRuntimeError> {
+        let response = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&transport.bot_token)
+            .json(&SlackPostMessageRequest::for_session(
+                &transport.channel,
+                session,
+            ))
+            .send()
+            .map_err(SlackRuntimeError::Http)?;
+        let response: SlackApiResponse = response.json().map_err(SlackRuntimeError::Http)?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(SlackRuntimeError::Api {
+                method: "chat.postMessage",
+                error: response.error.unwrap_or_else(|| "unknown_error".to_owned()),
+            })
+        }
+    }
+
+    fn run_socket_mode(
+        &self,
+        transport: &SlackTransportRuntime,
+        state: &SharedDaemonState,
+    ) -> Result<(), SlackRuntimeError> {
+        let response = self
+            .http
+            .post("https://slack.com/api/apps.connections.open")
+            .bearer_auth(&transport.app_token)
+            .send()
+            .map_err(SlackRuntimeError::Http)?;
+        let response: SlackConnectionOpenResponse =
+            response.json().map_err(SlackRuntimeError::Http)?;
+        if !response.ok {
+            return Err(SlackRuntimeError::Api {
+                method: "apps.connections.open",
+                error: response.error.unwrap_or_else(|| "unknown_error".to_owned()),
+            });
+        }
+        let url = response.url.ok_or(SlackRuntimeError::MissingSocketUrl)?;
+        let (mut socket, _) = tungstenite::connect(url).map_err(SlackRuntimeError::WebSocket)?;
+
+        loop {
+            let message = socket.read().map_err(SlackRuntimeError::WebSocket)?;
+            if !message.is_text() {
+                continue;
+            }
+            let envelope: SlackSocketEnvelope =
+                serde_json::from_str(message.to_text().unwrap_or_default())
+                    .map_err(SlackRuntimeError::Parse)?;
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&SlackSocketAck {
+                        envelope_id: envelope.envelope_id.clone(),
+                    })
+                    .map_err(SlackRuntimeError::Serialize)?
+                    .into(),
+                ))
+                .map_err(SlackRuntimeError::WebSocket)?;
+            if let Some(decision) = envelope.into_decision() {
+                apply_slack_decision(state, decision)?;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SlackPostMessageRequest {
+    channel: String,
+    text: String,
+    blocks: Vec<SlackBlock>,
+}
+
+impl SlackPostMessageRequest {
+    fn for_session(channel: &str, session: &ApprovalSession) -> Self {
+        let request = session.request();
+        let grants = request
+            .grants
+            .iter()
+            .map(|grant| format!("{} via {}", grant.name, grant.provider))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let command = request.command.join(" ");
+        let mut elements = vec![
+            SlackElement::button(
+                "Approve",
+                "primary",
+                "heim.approve",
+                SlackActionValue::approved(session.id()),
+            ),
+            SlackElement::button(
+                "Deny",
+                "danger",
+                "heim.deny",
+                SlackActionValue::denied(session.id()),
+            ),
+        ];
+
+        for option in &request.options {
+            elements.push(SlackElement::button(
+                option.label.as_str(),
+                "primary",
+                "heim.approve_option",
+                SlackActionValue::approved_with_option(session.id(), option),
+            ));
+        }
+
+        Self {
+            channel: channel.to_owned(),
+            text: format!("Heim approval requested for {command}"),
+            blocks: vec![
+                SlackBlock::section(format!(
+                    "*Heim approval requested*\nRequester: `{}`\nCommand: `{}`\nGrants: `{}`\nSession: `{}`",
+                    request.requester,
+                    command,
+                    grants,
+                    session.id()
+                )),
+                SlackBlock::actions(elements),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SlackBlock {
+    Section { text: SlackText },
+    Actions { elements: Vec<SlackElement> },
+}
+
+impl SlackBlock {
+    fn section(text: String) -> Self {
+        Self::Section {
+            text: SlackText::mrkdwn(text),
+        }
+    }
+
+    fn actions(elements: Vec<SlackElement>) -> Self {
+        Self::Actions { elements }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SlackText {
+    #[serde(rename = "type")]
+    text_type: &'static str,
+    text: String,
+}
+
+impl SlackText {
+    fn mrkdwn(text: String) -> Self {
+        Self {
+            text_type: "mrkdwn",
+            text,
+        }
+    }
+
+    fn plain(text: &str) -> Self {
+        Self {
+            text_type: "plain_text",
+            text: text.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SlackElement {
+    #[serde(rename = "type")]
+    element_type: &'static str,
+    text: SlackText,
+    style: &'static str,
+    action_id: &'static str,
+    value: String,
+}
+
+impl SlackElement {
+    fn button(
+        text: &str,
+        style: &'static str,
+        action_id: &'static str,
+        value: SlackActionValue,
+    ) -> Self {
+        Self {
+            element_type: "button",
+            text: SlackText::plain(text),
+            style,
+            action_id,
+            value: serde_json::to_string(&value).expect("slack action value serializes"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SlackActionValue {
+    session_id: String,
+    decision: SlackActionDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    option_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    option_label: Option<String>,
+}
+
+impl SlackActionValue {
+    fn approved(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            decision: SlackActionDecision::Approved,
+            option_id: None,
+            option_label: None,
+        }
+    }
+
+    fn denied(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            decision: SlackActionDecision::Denied,
+            option_id: None,
+            option_label: None,
+        }
+    }
+
+    fn approved_with_option(session_id: &str, option: &ApprovalOption) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            decision: SlackActionDecision::ApprovedWithOption,
+            option_id: Some(option.id.clone()),
+            option_label: Some(option.label.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SlackActionDecision {
+    Approved,
+    Denied,
+    ApprovedWithOption,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackApiResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackConnectionOpenResponse {
+    ok: bool,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackSocketEnvelope {
+    envelope_id: String,
+    payload: Option<SlackSocketPayload>,
+}
+
+impl SlackSocketEnvelope {
+    fn into_decision(self) -> Option<SlackResolvedDecision> {
+        let payload = self.payload?;
+        if payload.payload_type != "block_actions" {
+            return None;
+        }
+        let action = payload.actions.into_iter().next()?;
+        let value: SlackActionValue = serde_json::from_str(&action.value).ok()?;
+        Some(SlackResolvedDecision {
+            value,
+            approver: payload
+                .user
+                .map(|user| user.id)
+                .unwrap_or_else(|| "slack".to_owned()),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackSocketPayload {
+    #[serde(rename = "type")]
+    payload_type: String,
+    user: Option<SlackSocketUser>,
+    #[serde(default)]
+    actions: Vec<SlackSocketAction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackSocketUser {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackSocketAction {
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SlackSocketAck {
+    envelope_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackResolvedDecision {
+    value: SlackActionValue,
+    approver: String,
+}
+
+fn apply_slack_decision(
+    state: &SharedDaemonState,
+    decision: SlackResolvedDecision,
+) -> Result<(), SlackRuntimeError> {
+    let approval = match decision.value.decision {
+        SlackActionDecision::Approved => ApprovalDecision::Approved {
+            decision: ApprovalGrantDecision::new(decision.approver, slack_decided_at()),
+        },
+        SlackActionDecision::Denied => ApprovalDecision::Denied {
+            decision: ApprovalGrantDecision::new(decision.approver, slack_decided_at()),
+        },
+        SlackActionDecision::ApprovedWithOption => ApprovalDecision::ApprovedWithOption {
+            decision: ApprovalGrantDecision::new(decision.approver, slack_decided_at()),
+            option: ApprovalOption::new(
+                decision.value.option_id.unwrap_or_default(),
+                decision.value.option_label.unwrap_or_default(),
+            ),
+        },
+    };
+    match handle_request(
+        state,
+        DaemonRequest::ApprovalDecide {
+            session_id: decision.value.session_id,
+            decision: approval,
+        },
+    ) {
+        DaemonResponse::ApprovalDecided { .. } => Ok(()),
+        DaemonResponse::Error { message, .. } => Err(SlackRuntimeError::Decision(message)),
+        other => Err(SlackRuntimeError::Decision(format!(
+            "unexpected daemon response: {other:?}"
+        ))),
+    }
+}
+
+fn slack_decided_at() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
+}
+
+#[derive(Debug)]
+pub enum SlackRuntimeError {
+    Http(reqwest::Error),
+    WebSocket(tungstenite::Error),
+    Serialize(serde_json::Error),
+    Parse(serde_json::Error),
+    Api { method: &'static str, error: String },
+    MissingSocketUrl,
+    Decision(String),
+}
+
+impl fmt::Display for SlackRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http(source) => write!(formatter, "slack HTTP request failed: {source}"),
+            Self::WebSocket(source) => write!(formatter, "slack socket mode failed: {source}"),
+            Self::Serialize(source) => {
+                write!(formatter, "failed to serialize slack message: {source}")
+            }
+            Self::Parse(source) => {
+                write!(formatter, "failed to parse slack socket message: {source}")
+            }
+            Self::Api { method, error } => write!(formatter, "slack API {method} failed: {error}"),
+            Self::MissingSocketUrl => formatter
+                .write_str("slack API apps.connections.open did not return a Socket Mode URL"),
+            Self::Decision(message) => write!(
+                formatter,
+                "failed to apply slack approval decision: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SlackRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Http(source) => Some(source),
+            Self::WebSocket(source) => Some(source),
+            Self::Serialize(source) | Self::Parse(source) => Some(source),
+            Self::Api { .. } | Self::MissingSocketUrl | Self::Decision(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ApprovalSessionStore {
     sessions: BTreeMap<String, ApprovalSession>,
@@ -311,6 +929,17 @@ impl std::error::Error for ApprovalSessionStoreError {
 }
 
 fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonResponse {
+    handle_request_with_dispatch::<SlackSocketModeClient>(state, request, None)
+}
+
+fn handle_request_with_dispatch<C>(
+    state: &SharedDaemonState,
+    request: DaemonRequest,
+    dispatch: Option<&ApprovalDispatchRuntime<C>>,
+) -> DaemonResponse
+where
+    C: SlackSocketModeApi + Clone + Send + Sync + 'static,
+{
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
         DaemonRequest::ApprovalCreate {
@@ -330,6 +959,12 @@ fn handle_request(state: &SharedDaemonState, request: DaemonRequest) -> DaemonRe
                 },
             };
             state.approvals_changed.notify_all();
+            if let (DaemonResponse::ApprovalCreated { session }, Some(dispatch)) =
+                (&response, dispatch)
+                && let Err(error) = dispatch.dispatch_session(session)
+            {
+                eprintln!("heimd: approval dispatch failed: {error}");
+            }
             response
         }
         DaemonRequest::ApprovalGet { session_id } => {
@@ -423,11 +1058,27 @@ fn encode_json_line(value: &impl Serialize) -> Result<String, DaemonError> {
 
 #[cfg(unix)]
 pub fn serve_once(socket: &Path) -> Result<(), DaemonError> {
-    serve(socket, true)
+    serve_once_with_dispatch(socket, ApprovalDispatchRuntime::empty())
+}
+
+#[cfg(unix)]
+fn serve_once_with_dispatch(
+    socket: &Path,
+    dispatch: ApprovalDispatchRuntime,
+) -> Result<(), DaemonError> {
+    serve(socket, true, dispatch)
 }
 
 #[cfg(not(unix))]
 pub fn serve_once(_socket: &Path) -> Result<(), DaemonError> {
+    serve_once_with_dispatch(_socket, ApprovalDispatchRuntime::empty())
+}
+
+#[cfg(not(unix))]
+fn serve_once_with_dispatch(
+    _socket: &Path,
+    _dispatch: ApprovalDispatchRuntime,
+) -> Result<(), DaemonError> {
     Err(DaemonError::UnsupportedPlatform {
         feature: "local daemon sockets",
     })
@@ -435,18 +1086,34 @@ pub fn serve_once(_socket: &Path) -> Result<(), DaemonError> {
 
 #[cfg(unix)]
 pub fn serve_forever(socket: &Path) -> Result<(), DaemonError> {
-    serve(socket, false)
+    serve_forever_with_dispatch(socket, ApprovalDispatchRuntime::empty())
+}
+
+#[cfg(unix)]
+fn serve_forever_with_dispatch(
+    socket: &Path,
+    dispatch: ApprovalDispatchRuntime,
+) -> Result<(), DaemonError> {
+    serve(socket, false, dispatch)
 }
 
 #[cfg(not(unix))]
 pub fn serve_forever(_socket: &Path) -> Result<(), DaemonError> {
+    serve_forever_with_dispatch(_socket, ApprovalDispatchRuntime::empty())
+}
+
+#[cfg(not(unix))]
+fn serve_forever_with_dispatch(
+    _socket: &Path,
+    _dispatch: ApprovalDispatchRuntime,
+) -> Result<(), DaemonError> {
     Err(DaemonError::UnsupportedPlatform {
         feature: "local daemon sockets",
     })
 }
 
 #[cfg(unix)]
-fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
+fn serve(socket: &Path, once: bool, dispatch: ApprovalDispatchRuntime) -> Result<(), DaemonError> {
     use std::os::unix::net::UnixListener;
 
     if let Some(parent) = socket.parent() {
@@ -468,6 +1135,8 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
     })?;
     let _socket_file_guard = SocketFileGuard::new(socket);
     let state = Arc::new(SharedDaemonState::new());
+    dispatch.start_socket_mode(Arc::clone(&state));
+    let dispatch = Arc::new(dispatch);
     let connection_limit = Arc::new(ActiveConnectionLimit::new(MAX_ACTIVE_CONNECTIONS));
     let wait_limit = Arc::new(ActiveConnectionLimit::new(MAX_ACTIVE_APPROVAL_WAITS));
 
@@ -476,15 +1145,18 @@ fn serve(socket: &Path, once: bool) -> Result<(), DaemonError> {
             .accept()
             .map_err(|source| DaemonError::AcceptConnection { source })?;
         if once {
-            if let Err(error) = handle_stream(&state, stream, None, &wait_limit) {
+            if let Err(error) = handle_stream(&state, &dispatch, stream, None, &wait_limit) {
                 handle_connection_error(error, true)?;
             }
         } else {
             let state = Arc::clone(&state);
+            let dispatch = Arc::clone(&dispatch);
             let permit = Arc::clone(&connection_limit).acquire();
             let wait_limit = Arc::clone(&wait_limit);
             std::thread::spawn(move || {
-                if let Err(error) = handle_stream(&state, stream, Some(permit), &wait_limit) {
+                if let Err(error) =
+                    handle_stream(&state, &dispatch, stream, Some(permit), &wait_limit)
+                {
                     eprintln!("heimd: connection error: {error}");
                 }
             });
@@ -627,6 +1299,7 @@ fn handle_connection_error(error: DaemonError, once: bool) -> Result<(), DaemonE
 #[cfg(unix)]
 fn handle_stream(
     state: &SharedDaemonState,
+    dispatch: &ApprovalDispatchRuntime,
     stream: std::os::unix::net::UnixStream,
     read_permit: Option<ActiveConnectionPermit>,
     wait_limit: &Arc<ActiveConnectionLimit>,
@@ -672,7 +1345,7 @@ fn handle_stream(
         None
     };
 
-    let response = handle_request(state, request);
+    let response = handle_request_with_dispatch(state, request, Some(dispatch));
     let line = encode_response(&response)?;
     let mut writer = stream;
     writer
@@ -728,6 +1401,13 @@ fn command_error(code: i32, stderr: impl Into<String>) -> CommandResult {
 #[derive(Debug)]
 pub enum DaemonError {
     ConfigPath(heim_config::ConfigError),
+    LoadConfig(heim_config::ConfigError),
+    ResolveSecret(heim_sources::SecretSourceError),
+    ApprovalDispatchConfig {
+        transport: String,
+        message: String,
+    },
+    Slack(SlackRuntimeError),
     UnsupportedPlatform {
         feature: &'static str,
     },
@@ -769,6 +1449,15 @@ impl fmt::Display for DaemonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConfigPath(source) => write!(formatter, "{source}"),
+            Self::LoadConfig(source) => write!(formatter, "failed to load daemon config: {source}"),
+            Self::ResolveSecret(source) => write!(formatter, "{source}"),
+            Self::ApprovalDispatchConfig { transport, message } => {
+                write!(
+                    formatter,
+                    "approval transport {transport} is invalid: {message}"
+                )
+            }
+            Self::Slack(source) => write!(formatter, "{source}"),
             Self::UnsupportedPlatform { feature } => {
                 write!(
                     formatter,
@@ -811,7 +1500,9 @@ impl fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ConfigPath(source) => Some(source),
+            Self::ConfigPath(source) | Self::LoadConfig(source) => Some(source),
+            Self::ResolveSecret(source) => Some(source),
+            Self::Slack(source) => Some(source),
             Self::CreateDir { source, .. }
             | Self::BindSocket { source, .. }
             | Self::ConnectSocket { source, .. }
@@ -821,7 +1512,9 @@ impl std::error::Error for DaemonError {
             | Self::ReadConnection { source }
             | Self::WriteConnection { source } => Some(source),
             Self::Serialize(source) | Self::Parse(source) => Some(source),
-            Self::UnsupportedPlatform { .. } | Self::SocketExists { .. } => None,
+            Self::ApprovalDispatchConfig { .. }
+            | Self::UnsupportedPlatform { .. }
+            | Self::SocketExists { .. } => None,
         }
     }
 }
@@ -1033,7 +1726,142 @@ mod tests {
                     == &ApprovalSessionStatus::ApprovedWithOption {
                         decision: ApprovalGrantDecision::new("alice", "2026-05-24T12:00:00Z"),
                         option: ApprovalOption::new("15m", "Approve 15m"),
-                    }
+            }
+        ));
+    }
+
+    #[test]
+    fn slack_runtime_dispatches_matching_approval_session() {
+        let client = RecordingSlackSocketModeClient::default();
+        let runtime = test_slack_runtime(client.clone());
+        let session = heim_approvals::ApprovalSession::new("session-1", approval_request(), None)
+            .expect("session");
+
+        runtime.dispatch_session(&session).expect("dispatch");
+
+        assert_eq!(
+            client.posts.lock().expect("posts").as_slice(),
+            [("slack".to_owned(), "session-1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn approval_create_dispatches_slack_session() {
+        let state = SharedDaemonState::new();
+        let client = RecordingSlackSocketModeClient::default();
+        let dispatch = super::ApprovalDispatchRuntime {
+            slack: Some(test_slack_runtime(client.clone())),
+        };
+
+        let response = super::handle_request_with_dispatch(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+            Some(&dispatch),
+        );
+
+        assert!(matches!(response, DaemonResponse::ApprovalCreated { .. }));
+        assert_eq!(
+            client.posts.lock().expect("posts").as_slice(),
+            [("slack".to_owned(), "session-1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn approval_create_returns_created_when_slack_dispatch_fails() {
+        let state = SharedDaemonState::new();
+        let client = RecordingSlackSocketModeClient {
+            fail_posts: true,
+            ..Default::default()
+        };
+        let dispatch = super::ApprovalDispatchRuntime {
+            slack: Some(test_slack_runtime(client)),
+        };
+
+        let response = super::handle_request_with_dispatch(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+            Some(&dispatch),
+        );
+        let stored = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalGet {
+                session_id: "session-1".to_owned(),
+            },
+        );
+
+        assert!(matches!(response, DaemonResponse::ApprovalCreated { .. }));
+        assert!(matches!(stored, DaemonResponse::ApprovalSession { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_runtime_does_not_load_auth_without_approval_transports() {
+        let dir = TestDir::new("dispatch-no-transports");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[providers.aws_prod]
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789012:role/ProdReadonly"
+"#,
+        )
+        .expect("write config");
+
+        let runtime = super::ApprovalDispatchRuntime::from_sources(Some(config), None)
+            .expect("dispatch runtime");
+
+        assert!(runtime.slack.is_none());
+    }
+
+    #[test]
+    fn slack_action_applies_approval_decision() {
+        let state = SharedDaemonState::new();
+        let _ = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalCreate {
+                session_id: "session-1".to_owned(),
+                request: approval_request(),
+                expires_at: None,
+            },
+        );
+
+        super::apply_slack_decision(
+            &state,
+            super::SlackResolvedDecision {
+                approver: "U123".to_owned(),
+                value: super::SlackActionValue {
+                    session_id: "session-1".to_owned(),
+                    decision: super::SlackActionDecision::ApprovedWithOption,
+                    option_id: Some("15m".to_owned()),
+                    option_label: Some("Approve 15m".to_owned()),
+                },
+            },
+        )
+        .expect("slack decision");
+
+        let response = super::handle_request(
+            &state,
+            DaemonRequest::ApprovalGet {
+                session_id: "session-1".to_owned(),
+            },
+        );
+        assert!(matches!(
+            response,
+            DaemonResponse::ApprovalSession { ref session }
+                if matches!(
+                    session.status(),
+                    ApprovalSessionStatus::ApprovedWithOption { option, .. }
+                        if option.id == "15m"
+                )
         ));
     }
 
@@ -1375,6 +2203,53 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSlackSocketModeClient {
+        posts: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        fail_posts: bool,
+    }
+
+    impl super::SlackSocketModeApi for RecordingSlackSocketModeClient {
+        fn post_approval_request(
+            &self,
+            transport: &super::SlackTransportRuntime,
+            session: &heim_approvals::ApprovalSession,
+        ) -> Result<(), super::SlackRuntimeError> {
+            if self.fail_posts {
+                return Err(super::SlackRuntimeError::Decision(
+                    "dispatch failed".to_owned(),
+                ));
+            }
+            self.posts
+                .lock()
+                .expect("posts")
+                .push((transport.name.clone(), session.id().to_owned()));
+            Ok(())
+        }
+
+        fn run_socket_mode(
+            &self,
+            _transport: &super::SlackTransportRuntime,
+            _state: &super::SharedDaemonState,
+        ) -> Result<(), super::SlackRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn test_slack_runtime(
+        client: RecordingSlackSocketModeClient,
+    ) -> super::SlackApprovalRuntime<RecordingSlackSocketModeClient> {
+        super::SlackApprovalRuntime::new(
+            client,
+            [super::SlackTransportRuntime {
+                name: "slack".to_owned(),
+                channel: "#heim-approvals".to_owned(),
+                bot_token: "xoxb-secret".to_owned(),
+                app_token: "xapp-secret".to_owned(),
+            }],
+        )
     }
 
     #[cfg(unix)]
