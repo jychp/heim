@@ -643,9 +643,16 @@ fn handle_stream(
         .read_line(&mut line)
         .map_err(|source| DaemonError::ReadConnection { source })?;
     let request = serde_json::from_str::<DaemonRequest>(&line).map_err(DaemonError::Parse)?;
-    drop(read_permit);
 
-    let _wait_permit = if matches!(request, DaemonRequest::ApprovalWait { .. }) {
+    let is_approval_wait = matches!(request, DaemonRequest::ApprovalWait { .. });
+    let _read_permit = if is_approval_wait {
+        drop(read_permit);
+        None
+    } else {
+        read_permit
+    };
+
+    let _wait_permit = if is_approval_wait {
         match Arc::clone(wait_limit).try_acquire() {
             Some(permit) => Some(permit),
             None => {
@@ -1322,6 +1329,20 @@ mod tests {
         let result = super::handle_connection_error(error, false);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn active_connection_limit_releases_permits_on_drop() {
+        let limit = std::sync::Arc::new(super::ActiveConnectionLimit::new(1));
+        let permit = std::sync::Arc::clone(&limit)
+            .try_acquire()
+            .expect("first permit");
+
+        assert!(std::sync::Arc::clone(&limit).try_acquire().is_none());
+
+        drop(permit);
+
+        assert!(std::sync::Arc::clone(&limit).try_acquire().is_some());
     }
 
     #[cfg(unix)]
