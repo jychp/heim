@@ -19,7 +19,7 @@ heim-policy = { version = "0.1.0", path = "../heim-policy" }
 heim-providers = { version = "0.1.0", path = "../heim-providers" }
 heim-sources = { version = "0.1.0", path = "../heim-sources" }
 serde_json.workspace = true
-sysinfo = { version = "0.39.2", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
 
 [[bin]]
 name = "heim"
